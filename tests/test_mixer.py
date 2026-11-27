@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import ast
+import inspect
 import json
+import math
 import subprocess
 import sys
 import tempfile
@@ -32,12 +34,19 @@ from mixer.sketch_engine import (
 from mixer.solar_engine import (
     CITY_PRESETS,
     KEY_DATES,
+    _format_shadow_frame_label,
+    _read_ifc_source,
+    _select_shadow_casters,
     build_scalar_heatmap_overlay,
+    build_shadow_mesh,
     compute_direct_sun_hours_for_points,
     compute_passive_solar_reward,
+    describe_solar_lighting_for_camera,
     envelope_gates,
+    project_shadow_triangles_pure,
     read_ifc_true_north_deg,
     render_sun_dial_svg,
+    select_timelapse_solar_hours,
     solar_day_arc,
     solar_position,
 )
@@ -48,9 +57,12 @@ from mixer.studio_render import (
     VIBE_INSPIRATION_CHIPS,
     _clip_near,
     _rasterize_camera_views,
+    _resolve_space_boxes,
     _should_skip_ifc_class,
     build_render_prompt,
     compute_camera_pose,
+    derive_rooms_from_walls,
+    first_wall_hit_distance_m,
 )
 from verifier.verify_client import (
     ExportBundle,
@@ -525,6 +537,69 @@ class TestStudioRender(unittest.TestCase):
         self.assertAlmostEqual(p_eye["eye"][0], p_opp["target"][0], places=4)
         self.assertAlmostEqual(p_opp["eye"][0], p_eye["target"][0], places=4)
 
+    def test_derive_rooms_l_shaped_and_forward_ray_guard(self) -> None:
+        # L-shaped exterior loop: notch cuts out x in (5, 10), y in (5, 9) so bbox diagonal crosses outside!
+        l_walls = [
+            {"id": "w1", "start": (0.0, 0.0), "end": (10.0, 0.0), "base_z_m": 0.0, "height_m": 3.0, "thickness_m": 0.2},
+            {"id": "w2", "start": (10.0, 0.0), "end": (10.0, 5.0), "base_z_m": 0.0, "height_m": 3.0, "thickness_m": 0.2},
+            {"id": "w3", "start": (10.0, 5.0), "end": (5.0, 5.0), "base_z_m": 0.0, "height_m": 3.0, "thickness_m": 0.2},
+            {"id": "w4", "start": (5.0, 5.0), "end": (5.0, 9.0), "base_z_m": 0.0, "height_m": 3.0, "thickness_m": 0.2},
+            {"id": "w5", "start": (5.0, 9.0), "end": (0.0, 9.0), "base_z_m": 0.0, "height_m": 3.0, "thickness_m": 0.2},
+            {"id": "w6", "start": (0.0, 9.0), "end": (0.0, 0.0), "base_z_m": 0.0, "height_m": 3.0, "thickness_m": 0.2},
+        ]
+        rooms = derive_rooms_from_walls(l_walls)
+        self.assertEqual(len(rooms), 1)
+        pose = compute_camera_pose(
+            (0.0, 0.0, 0.0),
+            (10.0, 9.0, 3.0),
+            "eye_level_interior",
+            storey_elevations_m=[0.0],
+            space_boxes=rooms,
+            wall_segments=l_walls,
+        )
+        self.assertFalse(pose["camera_fallback"])
+        hit_m = first_wall_hit_distance_m(pose["eye"], pose["forward"], l_walls)
+        self.assertIsNotNone(hit_m)
+        self.assertGreaterEqual(hit_m, 3.0)
+
+        # Forward-ray guard rejects a close-wall candidate or flags fallback when all views < min_clearance_m.
+        self.assertGreaterEqual(
+            inspect.signature(compute_camera_pose).parameters["min_clearance_m"].default,
+            3.0,
+        )
+        tiny_box = [{"xmin": 0.0, "ymin": 0.0, "xmax": 2.0, "ymax": 2.0, "zmin": 0.0}]
+        tiny_walls = [
+            {"start": (0.0, 0.0), "end": (2.0, 0.0), "base_z_m": 0.0, "height_m": 3.0, "thickness_m": 0.2},
+            {"start": (2.0, 0.0), "end": (2.0, 2.0), "base_z_m": 0.0, "height_m": 3.0, "thickness_m": 0.2},
+            {"start": (2.0, 2.0), "end": (0.0, 2.0), "base_z_m": 0.0, "height_m": 3.0, "thickness_m": 0.2},
+            {"start": (0.0, 2.0), "end": (0.0, 0.0), "base_z_m": 0.0, "height_m": 3.0, "thickness_m": 0.2},
+        ]
+        # Must trigger using the default min_clearance_m (M3 mutation guard).
+        tiny_pose = compute_camera_pose(
+            (0.0, 0.0, 0.0),
+            (2.0, 2.0, 3.0),
+            "eye_level_interior",
+            space_boxes=tiny_box,
+            wall_segments=tiny_walls,
+        )
+        self.assertTrue(tiny_pose["camera_fallback"])
+        self.assertEqual(tiny_pose["fallback_reason"], "nearest_wall_under_min_clearance")
+
+        # Level 2 zmin stays exact (e.g. 12 ft = 3.6576 m), not rounded to 3.5 m.
+        l2_walls = [
+            {"start": (0.0, 0.0), "end": (6.0, 0.0), "base_z_m": 3.6576, "height_m": 2.7432, "thickness_m": 0.2},
+            {"start": (6.0, 0.0), "end": (6.0, 5.0), "base_z_m": 3.6576, "height_m": 2.7432, "thickness_m": 0.2},
+            {"start": (6.0, 5.0), "end": (0.0, 5.0), "base_z_m": 3.6576, "height_m": 2.7432, "thickness_m": 0.2},
+            {"start": (0.0, 5.0), "end": (0.0, 0.0), "base_z_m": 3.6576, "height_m": 2.7432, "thickness_m": 0.2},
+        ]
+        l2_rooms = derive_rooms_from_walls(l2_walls)
+        self.assertEqual(len(l2_rooms), 1)
+        self.assertAlmostEqual(l2_rooms[0]["zmin"], 3.6576, places=4)
+
+        empty_pose = compute_camera_pose((0.0, 0.0, 0.0), (10.0, 8.0, 3.0), "eye_level_interior", space_boxes=[])
+        self.assertTrue(empty_pose["camera_fallback"])
+        self.assertEqual(empty_pose["fallback_reason"], "no_rooms_detected")
+
 
 class TestSolarEngine(unittest.TestCase):
     def test_solar_position_hemispheres_and_equinox(self) -> None:
@@ -658,6 +733,350 @@ class TestSolarEngine(unittest.TestCase):
             step_minutes=30,
         )
         self.assertGreater(h_tsouth, h_tnorth + 4.0)
+
+    def test_shadow_projection_pure_direction_window_stability_mutation(self) -> None:
+        def _box_tris(x0: float, y0: float, z0: float, x1: float, y1: float, z1: float) -> list[Any]:
+            v = [
+                (x0, y0, z0),
+                (x1, y0, z0),
+                (x1, y1, z0),
+                (x0, y1, z0),
+                (x0, y0, z1),
+                (x1, y0, z1),
+                (x1, y1, z1),
+                (x0, y1, z1),
+            ]
+            idx = [
+                (0, 2, 1), (0, 3, 2),  # bottom
+                (4, 5, 6), (4, 6, 7),  # top
+                (0, 1, 5), (0, 5, 4),  # -Y
+                (1, 2, 6), (1, 6, 5),  # +X
+                (2, 3, 7), (2, 7, 6),  # +Y
+                (3, 0, 4), (3, 4, 7),  # -X
+            ]
+            return [(v[a], v[b], v[c]) for a, b, c in idx]
+
+        def _point_in_tri_2d(px: float, py: float, tri: Any) -> bool:
+            a, b, c = tri
+            d1 = (px - b[0]) * (a[1] - b[1]) - (a[0] - b[0]) * (py - b[1])
+            d2 = (px - c[0]) * (b[1] - c[1]) - (b[0] - c[0]) * (py - c[1])
+            d3 = (px - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (py - a[1])
+            has_neg = (d1 < -1e-6) or (d2 < -1e-6) or (d3 < -1e-6)
+            has_pos = (d1 > 1e-6) or (d2 > 1e-6) or (d3 > 1e-6)
+            return not (has_neg and has_pos)
+
+        def _covered_by_shadow(px: float, py: float, tris: list[Any]) -> bool:
+            return any(_point_in_tri_2d(px, py, tri) for tri in tris)
+
+        def _assert_box_shadow_matches(
+            shadow_tris: list[Any],
+            sun_vec: tuple[float, float, float],
+            height_m: float = 3.0,
+        ) -> None:
+            self.assertGreater(len(shadow_tris), 0, "Shadow triangles missing")
+            sx, sy, sz = sun_vec
+            horiz = math.hypot(sx, sy)
+            ux, uy = -sx / horiz, -sy / horiz
+            max_top_proj = max(x * ux + y * uy for x in (0.0, 1.0) for y in (0.0, 1.0))
+            pts = [pt for tri in shadow_tris for pt in tri]
+            for a, b, c in shadow_tris:
+                nz = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+                self.assertGreater(nz, 0.0)
+            far_edge = max(pt[0] * ux + pt[1] * uy for pt in pts) - max_top_proj
+            expected_len = height_m * horiz / sz  # height / tan(alt)
+            self.assertAlmostEqual(far_edge, expected_len, delta=0.15)
+            # Shadow centroid also moves strictly in -sun_horizontal direction from box center (0.5, 0.5).
+            cx = sum(pt[0] for pt in pts) / len(pts) - 0.5
+            cy = sum(pt[1] for pt in pts) / len(pts) - 0.5
+            self.assertGreater(cx * ux + cy * uy, 0.5)
+
+        # 1. Shadow direction & length for a 1 x 1 x 3 m box (and ensure floor slab at z<=0 casts nothing).
+        box_tris = _box_tris(0.0, 0.0, 0.0, 1.0, 1.0, 3.0)
+        slab_tris = _box_tris(-2.0, -2.0, -0.2, 3.0, 3.0, 0.0)
+        ground_rect = (-12.0, -12.0, 13.0, 13.0)
+        pos_15 = solar_position(51.5, 80, 15.0)
+        self.assertEqual(project_shadow_triangles_pure(slab_tris, pos_15.sun_vec, 0.0, ground_rect), [])
+        box_shadows = project_shadow_triangles_pure(box_tris, pos_15.sun_vec, 0.0, ground_rect)
+        _assert_box_shadow_matches(box_shadows, pos_15.sun_vec, height_m=3.0)
+
+        # 2. Window opening light: solid piers shade floor behind them; window opening lets sunlight through.
+        wall_with_window = (
+            _box_tris(0.0, -0.1, 0.0, 2.0, 0.1, 3.0)   # left pier
+            + _box_tris(4.0, -0.1, 0.0, 6.0, 0.1, 3.0)  # right pier
+            + _box_tris(2.0, -0.1, 0.0, 4.0, 0.1, 0.9)  # sill
+            + _box_tris(2.0, -0.1, 2.4, 4.0, 0.1, 3.0)  # lintel
+        )
+        sun_south_45 = (0.0, -math.cos(math.pi / 4.0), math.sin(math.pi / 4.0))
+        win_shadows = project_shadow_triangles_pure(wall_with_window, sun_south_45, 0.0, (-7.0, -7.0, 13.0, 13.0))
+        self.assertFalse(_covered_by_shadow(3.0, 1.65, win_shadows))
+        self.assertTrue(_covered_by_shadow(1.0, 1.65, win_shadows))
+        self.assertTrue(_covered_by_shadow(5.0, 1.65, win_shadows))
+
+        # 3. Frame stability: px_scale identical across every frame of a day sweep with padded ground bounds.
+        sweep, _, _ = solar_day_arc(51.5, 80, step_minutes=60)
+        sweep = [p for p in sweep if p.altitude_deg >= 8.0]
+        g_pad = (-7.0, -7.0, 8.0, 8.0)
+        scales = []
+        for pos in sweep:
+            s_tris = project_shadow_triangles_pure(box_tris, pos.sun_vec, 0.0, g_pad)
+            all_pts = [
+                (g_pad[0], g_pad[1], -0.03),
+                (g_pad[2], g_pad[3], -0.03),
+                *[pt for tri in box_tris for pt in tri],
+                *[pt for tri in s_tris for pt in tri],
+            ]
+            vmin = (min(p[0] for p in all_pts), min(p[1] for p in all_pts), min(p[2] for p in all_pts))
+            vmax = (max(p[0] for p in all_pts), max(p[1] for p in all_pts), max(p[2] for p in all_pts))
+            scales.append(compute_camera_pose(vmin, vmax, "isometric_cutaway", width=512, height=384)["px_scale"])
+        self.assertGreater(len(scales), 5)
+        self.assertAlmostEqual(min(scales), max(scales), places=9)
+
+        # 4. Mutation check: empty shadow list must fail the direction & length assertion.
+        with self.assertRaises(AssertionError):
+            _assert_box_shadow_matches([], pos_15.sun_vec, height_m=3.0)
+
+    def test_shadow_mesh_numpy_trimesh_direction_window_stability_mutation(self) -> None:
+        try:
+            import numpy as np  # type: ignore
+            import trimesh  # type: ignore
+        except ImportError:
+            self.skipTest("numpy/trimesh required for Trimesh shadow test")
+
+        def _box_mesh(x0: float, y0: float, z0: float, x1: float, y1: float, z1: float) -> Any:
+            return trimesh.creation.box(
+                extents=[x1 - x0, y1 - y0, z1 - z0],
+                transform=trimesh.transformations.translation_matrix([0.5 * (x0 + x1), 0.5 * (y0 + y1), 0.5 * (z0 + z1)]),
+            )
+
+        def _point_in_shadow_mesh(px: float, py: float, mesh: Any) -> bool:
+            if len(mesh.faces) == 0:
+                return False
+            tris = mesh.vertices[mesh.faces]
+            for a, b, c in tris:
+                d1 = (px - b[0]) * (a[1] - b[1]) - (a[0] - b[0]) * (py - b[1])
+                d2 = (px - c[0]) * (b[1] - c[1]) - (b[0] - c[0]) * (py - c[1])
+                d3 = (px - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (py - a[1])
+                if not (((d1 < -1e-6) or (d2 < -1e-6) or (d3 < -1e-6)) and ((d1 > 1e-6) or (d2 > 1e-6) or (d3 > 1e-6))):
+                    return True
+            return False
+
+        def _assert_mesh_shadow_matches(mesh: Any, sun_vec: tuple[float, float, float], height_m: float = 3.0) -> None:
+            self.assertGreater(len(mesh.faces), 0, "Empty shadow mesh")
+            sx, sy, sz = sun_vec
+            horiz = math.hypot(sx, sy)
+            ux, uy = -sx / horiz, -sy / horiz
+            max_top_proj = max(x * ux + y * uy for x in (0.0, 1.0) for y in (0.0, 1.0))
+            pts = mesh.vertices
+            far_edge = float((pts[:, 0] * ux + pts[:, 1] * uy).max()) - max_top_proj
+            self.assertAlmostEqual(far_edge, height_m * horiz / sz, delta=0.15)
+            self.assertTrue(np.all(mesh.face_normals[:, 2] > 0.99))
+
+        box = _box_mesh(0.0, 0.0, 0.0, 1.0, 1.0, 3.0)
+        box_tris = box.vertices[box.faces]
+        pos_15 = solar_position(51.5, 80, 15.0)
+        s_mesh = build_shadow_mesh(box_tris, pos_15.sun_vec, 0.0, (-12.0, -12.0, 13.0, 13.0))
+        _assert_mesh_shadow_matches(s_mesh, pos_15.sun_vec, height_m=3.0)
+
+        wall_parts = [
+            _box_mesh(0.0, -0.1, 0.0, 2.0, 0.1, 3.0),
+            _box_mesh(4.0, -0.1, 0.0, 6.0, 0.1, 3.0),
+            _box_mesh(2.0, -0.1, 0.0, 4.0, 0.1, 0.9),
+            _box_mesh(2.0, -0.1, 2.4, 4.0, 0.1, 3.0),
+        ]
+        wall_tris = np.concatenate([m.vertices[m.faces] for m in wall_parts], axis=0)
+        sun_south_45 = (0.0, -math.cos(math.pi / 4.0), math.sin(math.pi / 4.0))
+        win_mesh = build_shadow_mesh(wall_tris, sun_south_45, 0.0, (-7.0, -7.0, 13.0, 13.0))
+        self.assertFalse(_point_in_shadow_mesh(3.0, 1.65, win_mesh))
+        self.assertTrue(_point_in_shadow_mesh(1.0, 1.65, win_mesh))
+
+        sweep, _, _ = solar_day_arc(51.5, 80, step_minutes=60)
+        sweep = [p for p in sweep if p.altitude_deg >= 8.0]
+        g_pad = (-7.0, -7.0, 8.0, 8.0)
+        ground_mesh = trimesh.Trimesh(
+            np.array([[g_pad[0], g_pad[1], -0.03], [g_pad[2], g_pad[1], -0.03], [g_pad[2], g_pad[3], -0.03], [g_pad[0], g_pad[3], -0.03]]),
+            np.array([[0, 1, 2], [0, 2, 3]]),
+            process=False,
+        )
+        scales = []
+        for pos in sweep:
+            sm = build_shadow_mesh(box_tris, pos.sun_vec, 0.0, g_pad)
+            verts = np.vstack([ground_mesh.vertices, box.vertices, sm.vertices]) if len(sm.vertices) else np.vstack([ground_mesh.vertices, box.vertices])
+            scales.append(
+                compute_camera_pose(verts.min(0).tolist(), verts.max(0).tolist(), "isometric_cutaway", width=512, height=384)["px_scale"]
+            )
+        self.assertAlmostEqual(min(scales), max(scales), places=9)
+
+        empty_mesh = trimesh.Trimesh(np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int64), process=False)
+        with self.assertRaises(AssertionError):
+            _assert_mesh_shadow_matches(empty_mesh, pos_15.sun_vec, height_m=3.0)
+
+    def test_describe_solar_lighting_for_camera_prompt_and_timelapse_hours(self) -> None:
+        pose = compute_camera_pose((0.0, 0.0, 0.0), (12.0, 8.0, 3.5), "isometric_cutaway")
+        right = pose["right"]
+        # Synthetic sun along camera +right at golden hour altitude (10 deg) -> warm sun, cool shadow, screen-right.
+        alt10 = math.radians(10.0)
+        sun_right_pos = solar_position(51.5, 80, 17.0)
+        # Construct exact SolarPosition matching +right horizontal + sin(10 deg) up:
+        from mixer.solar_engine import SolarPosition
+        pos_right = SolarPosition(
+            hour_solar=17.0,
+            altitude_deg=10.0,
+            azimuth_deg=260.0,
+            shadow_len_1m=round(1.0 / math.tan(alt10), 2),
+            sun_vec=(right[0] * math.cos(alt10), right[1] * math.cos(alt10), math.sin(alt10)),
+        )
+        desc_right = describe_solar_lighting_for_camera(pos_right, pose)
+        self.assertEqual(desc_right["phase"], "golden_hour")
+        self.assertGreater(desc_right["sun_cam"][0], 0.5)
+        self.assertEqual(desc_right["screen_dir"], "upper-right")
+        self.assertIn("from screen-right", desc_right["prompt_cue"])
+        self.assertGreater(desc_right["sun_tint_rgb"][0], desc_right["sun_tint_rgb"][2])
+        self.assertGreater(desc_right["shadow_tint_rgb"][2], desc_right["shadow_tint_rgb"][0])
+
+        pos_left = SolarPosition(
+            hour_solar=8.0,
+            altitude_deg=22.0,
+            azimuth_deg=100.0,
+            shadow_len_1m=2.48,
+            sun_vec=(-right[0] * math.cos(math.radians(22.0)), -right[1] * math.cos(math.radians(22.0)), math.sin(math.radians(22.0))),
+        )
+        desc_left = describe_solar_lighting_for_camera(pos_left, pose)
+        self.assertEqual(desc_left["phase"], "low_sun")
+        self.assertIn("from screen-left", desc_left["prompt_cue"])
+
+        pos_night = SolarPosition(
+            hour_solar=21.0,
+            altitude_deg=-5.0,
+            azimuth_deg=310.0,
+            shadow_len_1m=None,
+            sun_vec=sun_right_pos.sun_vec,
+        )
+        desc_night = describe_solar_lighting_for_camera(pos_night, pose)
+        self.assertEqual(desc_night["phase"], "night")
+
+        base_pos, base_neg = build_render_prompt("Cedar atrium", "ArchDaily Golden Hour Timber", "isometric_cutaway")
+        sol_pos, sol_neg = build_render_prompt(
+            "Cedar atrium",
+            "ArchDaily Golden Hour Timber",
+            "isometric_cutaway",
+            solar_lighting_cue=desc_right["prompt_cue"],
+            solar_negative_cue=desc_right["negative_cue"],
+        )
+        self.assertNotIn("from screen-right", base_pos)
+        self.assertIn(desc_right["prompt_cue"], sol_pos)
+        self.assertIn(desc_right["negative_cue"], sol_neg)
+        self.assertNotIn("contradictory shadow direction", base_neg)
+
+        hrs = select_timelapse_solar_hours(51.5, 80, num_frames=4, min_altitude_deg=8.0)
+        self.assertEqual(len(hrs), 4)
+        self.assertEqual(hrs, sorted(hrs))
+        for h in hrs:
+            self.assertGreaterEqual(solar_position(51.5, 80, h).altitude_deg, 8.0)
+        self.assertEqual(select_timelapse_solar_hours(78.22, 355, num_frames=4), [12.0])
+        self.assertEqual(len(select_timelapse_solar_hours(78.22, 172, num_frames=4)), 4)
+
+    def test_ifc_source_path_vs_text_and_shadow_caster_flags(self) -> None:
+        # Missing str .ifc path must raise FileNotFoundError instead of being parsed as IFC text.
+        with self.assertRaises(FileNotFoundError):
+            _read_ifc_source("/tmp/nonexistent_mutinybim_dir_999/model.ifc")
+        with self.assertRaises(FileNotFoundError):
+            read_ifc_true_north_deg("/tmp/nonexistent_mutinybim_dir_999/model.ifc")
+
+        # Valid .ifc temp str path round-trips true north, _resolve_space_boxes, and envelope_gates.
+        step_ifc = """ISO-10303-21;
+DATA;
+#1=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#2=IFCCARTESIANPOINT((0.,0.,0.));
+#3=IFCAXIS2PLACEMENT3D(#2,$,$);
+#4=IFCDIRECTION((-0.5,0.8660254));
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-5,#3,#4);
+#10=IFCLOCALPLACEMENT($,#3);
+#20=IFCCARTESIANPOINT((3000.,0.,0.));
+#21=IFCAXIS2PLACEMENT2D(#20,$);
+#22=IFCRECTANGLEPROFILEDEF(.AREA.,$,#21,6000.,200.);
+#23=IFCEXTRUDEDAREASOLID(#22,#3,#4,3000.);
+#24=IFCSHAPEREPRESENTATION($,'Body','SweptSolid',(#23));
+#25=IFCPRODUCTDEFINITIONSHAPE($,$,(#24));
+#30=IFCCARTESIANPOINT((0.,0.,0.));
+#31=IFCDIRECTION((0.,0.,1.));
+#32=IFCDIRECTION((1.,0.,0.));
+#33=IFCAXIS2PLACEMENT3D(#30,#31,#32);
+#34=IFCLOCALPLACEMENT(#10,#33);
+#35=IFCWALL('w1',$,'Wall',$,$,#34,#25,$,$);
+#40=IFCCARTESIANPOINT((6000.,0.,0.));
+#41=IFCDIRECTION((0.,1.,0.));
+#42=IFCAXIS2PLACEMENT3D(#40,#31,#41);
+#43=IFCLOCALPLACEMENT(#10,#42);
+#44=IFCCARTESIANPOINT((2500.,0.,0.));
+#45=IFCAXIS2PLACEMENT2D(#44,$);
+#46=IFCRECTANGLEPROFILEDEF(.AREA.,$,#45,5000.,200.);
+#47=IFCEXTRUDEDAREASOLID(#46,#3,#31,3000.);
+#48=IFCSHAPEREPRESENTATION($,'Body','SweptSolid',(#47));
+#49=IFCPRODUCTDEFINITIONSHAPE($,$,(#48));
+#50=IFCWALL('w2',$,'Wall',$,$,#43,#49,$,$);
+#60=IFCCARTESIANPOINT((6000.,5000.,0.));
+#61=IFCDIRECTION((-1.,0.,0.));
+#62=IFCAXIS2PLACEMENT3D(#60,#31,#61);
+#63=IFCLOCALPLACEMENT(#10,#62);
+#64=IFCWALL('w3',$,'Wall',$,$,#63,#25,$,$);
+#70=IFCCARTESIANPOINT((0.,5000.,0.));
+#71=IFCDIRECTION((0.,-1.,0.));
+#72=IFCAXIS2PLACEMENT3D(#70,#31,#71);
+#73=IFCLOCALPLACEMENT(#10,#72);
+#74=IFCWALL('w4',$,'Wall',$,$,#73,#49,$,$);
+ENDSEC;
+"""
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "model.ifc"
+            p.write_text(step_ifc, encoding="utf-8")
+            p_str = str(p)
+            self.assertAlmostEqual(read_ifc_true_north_deg(p_str), -30.0, places=2)
+            self.assertAlmostEqual(read_ifc_true_north_deg(p), -30.0, places=2)
+            rooms_str = _resolve_space_boxes([], p_str)
+            self.assertEqual(len(rooms_str), 1)
+            explicit = [{"xmin": 1.0, "ymin": 1.0, "xmax": 4.0, "ymax": 4.0, "zmin": 0.0}]
+            self.assertEqual(_resolve_space_boxes(explicit, p_str), explicit)
+
+        # M4 & M8 guards: window excluded from casters, roof_assumed flagged & labeled.
+        class _DummyMesh:
+            def __init__(self, verts, n_faces=2):
+                self.vertices = verts
+                self.faces = [(0, 1, 2)] * n_faces
+
+        wall_m = _DummyMesh([(0.0, 0.0, 0.0), (6.0, 5.0, 3.0)])
+        win_m = _DummyMesh([(2.0, 0.0, 0.9), (3.2, 0.2, 2.4)])
+        floor_slab_m = _DummyMesh([(0.0, 0.0, -0.2), (6.0, 5.0, 0.0)])
+        roof_m = _DummyMesh([(0.0, 0.0, 3.0), (6.0, 5.0, 3.2)])
+        top_slab_m = _DummyMesh([(0.0, 0.0, 2.8), (6.0, 5.0, 3.0)])
+
+        casters_no_roof, roof_assumed_no_roof, roof_spec = _select_shadow_casters(
+            [("IfcWallStandardCase", wall_m, ()), ("IfcWindow", win_m, ()), ("IfcSlab", floor_slab_m, ())],
+            0.0,
+        )
+        self.assertIn(wall_m, casters_no_roof)
+        self.assertIn(floor_slab_m, casters_no_roof)
+        self.assertNotIn(win_m, casters_no_roof)
+        self.assertTrue(roof_assumed_no_roof)
+        self.assertIsNotNone(roof_spec)
+        self.assertAlmostEqual(roof_spec[4], 3.0, places=4)
+
+        pos = solar_position(51.5, 80, 12.0)
+        self.assertIn("roof assumed", _format_shadow_frame_label(pos, roof_assumed=True))
+        self.assertNotIn("roof assumed", _format_shadow_frame_label(pos, roof_assumed=False))
+
+        casters_with_roof, roof_assumed_with_roof, roof_spec_none = _select_shadow_casters(
+            [("IfcWall", wall_m, ()), ("IfcWindow", win_m, ()), ("IfcRoof", roof_m, ())],
+            0.0,
+        )
+        self.assertNotIn(win_m, casters_with_roof)
+        self.assertFalse(roof_assumed_with_roof)
+        self.assertIsNone(roof_spec_none)
+
+        _, roof_assumed_top_slab, _ = _select_shadow_casters(
+            [("IfcWall", wall_m, ()), ("IfcSlab", top_slab_m, ())],
+            0.0,
+        )
+        self.assertFalse(roof_assumed_top_slab)
 
     def test_passive_solar_reward_fail_closed_and_gates(self) -> None:
         # Omitting required gate keyword arguments must raise TypeError (never silently return 1.0).
@@ -944,6 +1363,15 @@ class TestMixerMcpServer(unittest.TestCase):
 
         pr = _call("build_studio_prompt", {"user_vibe": "Warm cedar library"})
         self.assertIn("Warm cedar library", pr["positive_prompt"])
+        self.assertNotIn("solar_lighting", pr)
+
+        pr_sol = _call(
+            "build_studio_prompt",
+            {"user_vibe": "Warm cedar library", "hour_solar": 16.75, "city": "london", "date": "spring_equinox"},
+        )
+        self.assertIn("solar_lighting", pr_sol)
+        self.assertEqual(pr_sol["solar_lighting"]["phase"], "golden_hour")
+        self.assertIn("golden-hour", pr_sol["positive_prompt"])
 
         compat = _call("check_adapter_compatibility", {"adapters": [{"r": 16, "lora_alpha": 16, "lora_dropout": 0.0, "bias": "none"}]})
         self.assertTrue(compat["all_compatible"])

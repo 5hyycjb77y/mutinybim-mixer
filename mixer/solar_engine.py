@@ -148,6 +148,133 @@ def solar_day_arc(
     return positions, sunrise_h, sunset_h
 
 
+def select_timelapse_solar_hours(
+    lat_deg: float,
+    day_of_year: int,
+    *,
+    num_frames: int = 4,
+    min_altitude_deg: float = 8.0,
+    true_north_deg: float = 0.0,
+) -> list[float]:
+    """Select evenly spaced daylight solar hours above ``min_altitude_deg`` for golden-hour sweeps."""
+    all_pos, _, _ = solar_day_arc(
+        lat_deg,
+        day_of_year,
+        step_minutes=15,
+        true_north_deg=true_north_deg,
+    )
+    valid = [p for p in all_pos if p.altitude_deg >= float(min_altitude_deg)]
+    if not valid:
+        if all_pos:
+            return [round(max(all_pos, key=lambda p: p.altitude_deg).hour_solar, 2)]
+        return [12.0]
+    n = max(1, int(num_frames))
+    if len(valid) <= n:
+        return [round(p.hour_solar, 2) for p in valid]
+    if n == 1:
+        return [round(valid[len(valid) // 2].hour_solar, 2)]
+    indices = [round(i * (len(valid) - 1) / (n - 1)) for i in range(n)]
+    return [round(valid[idx].hour_solar, 2) for idx in indices]
+
+
+def describe_solar_lighting_for_camera(
+    pos: SolarPosition,
+    pose: dict[str, Any],
+) -> dict[str, Any]:
+    """Project a solar vector into camera basis and derive prompt cues + physical color tints."""
+    sx, sy, sz = float(pos.sun_vec[0]), float(pos.sun_vec[1]), float(pos.sun_vec[2])
+    rx, ry, rz = (float(c) for c in pose["right"])
+    ux, uy, uz = (float(c) for c in pose["up"])
+    fx, fy, fz = (float(c) for c in pose["forward"])
+
+    sun_cam_x = sx * rx + sy * ry + sz * rz
+    sun_cam_y = sx * ux + sy * uy + sz * uz
+    sun_cam_z = sx * fx + sy * fy + sz * fz
+    alt = float(pos.altitude_deg)
+
+    if alt <= 0.5:
+        phase = "night"
+        sun_tint_rgb = (0.72, 0.78, 0.94)
+        shadow_tint_rgb = (0.65, 0.72, 0.95)
+        shadow_ambient = 0.28
+        screen_dir = "twilight"
+        prompt_cue = (
+            "blue-hour dusk ambience with warm interior architectural lighting, "
+            "soft cool twilight shadows, glowing windows"
+        )
+        negative_cue = ""
+    else:
+        if alt < 15.0:
+            phase = "golden_hour"
+            sun_tint_rgb = (1.08, 0.94, 0.76)
+            shadow_tint_rgb = (0.76, 0.86, 1.16)
+            shadow_ambient = 0.30
+            phase_desc = f"dramatic low golden-hour sunlight ({alt:.0f}° altitude)"
+            tone_desc = "warm amber sun patches through windows, cool indigo-blue ambient shade"
+        elif alt < 30.0:
+            phase = "low_sun"
+            sun_tint_rgb = (1.04, 0.98, 0.89)
+            shadow_tint_rgb = (0.84, 0.92, 1.12)
+            shadow_ambient = 0.33
+            phase_desc = f"warm angled architectural sunlight ({alt:.0f}° altitude)"
+            tone_desc = "crisp warm sun beams through windows, cool sky-blue ambient shadow fill"
+        elif alt < 52.0:
+            phase = "daylight"
+            sun_tint_rgb = (1.01, 1.00, 0.97)
+            shadow_tint_rgb = (0.89, 0.94, 1.09)
+            shadow_ambient = 0.35
+            phase_desc = f"clear natural architectural daylight ({alt:.0f}° altitude)"
+            tone_desc = "balanced warm-neutral sun patches, crisp cool shadow fill"
+        else:
+            phase = "high_noon"
+            sun_tint_rgb = (1.00, 1.00, 1.00)
+            shadow_tint_rgb = (0.91, 0.95, 1.06)
+            shadow_ambient = 0.36
+            phase_desc = f"bright high midday sunlight ({alt:.0f}° altitude)"
+            tone_desc = "tight sharp architectural shadows directly beneath walls and eaves, clean daylight"
+
+        if sun_cam_x > 0.25:
+            from_side = "from screen-right"
+            cast_dir = "stretching left across the floor"
+            screen_dir = "upper-right"
+        elif sun_cam_x < -0.25:
+            from_side = "from screen-left"
+            cast_dir = "stretching right across the floor"
+            screen_dir = "upper-left"
+        else:
+            from_side = "from overhead-center"
+            cast_dir = "falling cleanly across the floor"
+            screen_dir = "overhead"
+
+        if sun_cam_z > 0.35:
+            depth_desc = "backlit from ahead"
+        elif sun_cam_z < -0.35:
+            depth_desc = "front-lit from behind the camera"
+        else:
+            depth_desc = "side-raking"
+
+        prompt_cue = (
+            f"{phase_desc} {from_side} ({depth_desc}), "
+            f"crisp hard architectural shadows {cast_dir}, {tone_desc}, "
+            f"solar time {_fmt_hhmm(pos.hour_solar)}"
+        )
+        negative_cue = "flat uniform lighting, overcast shadowless sky, contradictory shadow direction"
+
+    return {
+        "phase": phase,
+        "altitude_deg": round(alt, 2),
+        "azimuth_deg": round(float(pos.azimuth_deg), 2),
+        "hour_solar": float(pos.hour_solar),
+        "sun_cam": (round(sun_cam_x, 4), round(sun_cam_y, 4), round(sun_cam_z, 4)),
+        "screen_dir": screen_dir,
+        "sun_tint_rgb": sun_tint_rgb,
+        "shadow_tint_rgb": shadow_tint_rgb,
+        "shadow_ambient": shadow_ambient,
+        "prompt_cue": prompt_cue,
+        "negative_cue": negative_cue,
+    }
+
+
 def build_scalar_heatmap_overlay(
     cells: list[dict[str, Any]],
     *,
@@ -267,15 +394,20 @@ def render_sun_dial_svg(
     )
 
 
+def _read_ifc_source(src: str | Path) -> str:
+    """Read IFC STEP text from a ``Path`` or ``str`` path, or pass through inline IFC text."""
+    if isinstance(src, Path):
+        return src.read_text(encoding="utf-8", errors="replace")
+    text = str(src)
+    upper = text.lstrip().upper()
+    if "\n" in text or upper.startswith("ISO-10303-21") or "=IFC" in upper:
+        return text
+    return Path(text).read_text(encoding="utf-8", errors="replace")
+
+
 def read_ifc_true_north_deg(ifc_path_or_text: str | Path) -> float:
     """Parse ``TrueNorth`` from an IFC's ``IfcGeometricRepresentationContext`` (degrees CW from Plan +Y)."""
-    if isinstance(ifc_path_or_text, Path):
-        text = ifc_path_or_text.read_text(encoding="utf-8", errors="replace")
-    elif "\n" in ifc_path_or_text or "IFC" in ifc_path_or_text.upper():
-        text = ifc_path_or_text
-    else:
-        p = Path(ifc_path_or_text)
-        text = p.read_text(encoding="utf-8", errors="replace") if p.exists() else str(ifc_path_or_text)
+    text = _read_ifc_source(ifc_path_or_text)
 
     directions: dict[str, tuple[float, float]] = {}
     for m in re.finditer(r"#(\d+)\s*=\s*IFCDIRECTION\(\(\s*([^\)]+?)\s*\)\)", text, re.IGNORECASE):
@@ -748,12 +880,26 @@ def _extract_model_elements_from_ifc(ifc_text: str) -> dict[str, Any]:
     windows: list[dict[str, Any]] = []
     roofs: list[dict[str, Any]] = []
     slabs: list[dict[str, Any]] = []
+    ceilings: list[dict[str, Any]] = []
+
+    def _polyline_pts2(poly_ref: str | None) -> list[tuple[float, float]]:
+        if not poly_ref or poly_ref not in entities:
+            return []
+        pet, pargs = entities[poly_ref]
+        if pet == "IFCPOLYLINE" and pargs:
+            pts: list[tuple[float, float]] = []
+            for pt_ref in _parse_step_ref_list(pargs[0]):
+                pt3 = _point3(pt_ref)
+                pts.append((pt3[0], pt3[1]))
+            return pts
+        return []
 
     for eid, (et, args) in entities.items():
         if et in ("IFCWALL", "IFCWALLSTANDARDCASE", "IFCCURTAINWALL") and len(args) >= 7:
             (wx, wy, wz), (wdx, wdy) = _world_placement(_step_ref(args[5]))
             solids = _extruded_solids(_step_ref(args[6]))
             length_m = 0.0
+            thickness_m = 0.20
             height_m = 3.0
             cx_local = 0.0
             cy_local = 0.0
@@ -763,7 +909,10 @@ def _extract_model_elements_from_ifc(ifc_text: str) -> dict[str, Any]:
                 if prof_et == "IFCRECTANGLEPROFILEDEF" and len(prof_args) >= 5:
                     try:
                         xdim = float(prof_args[3]) * unit_scale
+                        ydim = float(prof_args[4]) * unit_scale
                         length_m = max(length_m, xdim)
+                        if ydim > 0.01:
+                            thickness_m = ydim
                         pos2d = entities.get(_step_ref(prof_args[2]) or "")
                         if pos2d and pos2d[0] == "IFCAXIS2PLACEMENT2D" and len(pos2d[1]) >= 1:
                             c = _point3(_step_ref(pos2d[1][0]))
@@ -787,6 +936,7 @@ def _extract_model_elements_from_ifc(ifc_text: str) -> dict[str, Any]:
                     "height_m": height_m,
                     "top_z_m": wz + height_m,
                     "length_m": length_m,
+                    "thickness_m": thickness_m,
                     "is_external": is_ext,
                 }
             )
@@ -832,12 +982,31 @@ def _extract_model_elements_from_ifc(ifc_text: str) -> dict[str, Any]:
             for _, _, pos_loc, depth in _extruded_solids(_step_ref(args[6])):
                 max_top = max(max_top, sz + pos_loc[2] + depth)
             slabs.append({"id": eid, "base_z_m": sz, "top_z_m": max_top, "is_roof_type": ".ROOF." in pt})
+        elif et == "IFCCOVERING" and len(args) >= 7:
+            (cx, cy, cz), (cdx, cdy) = _world_placement(_step_ref(args[5]))
+            for prof_et, prof_args, pos_loc, depth in _extruded_solids(_step_ref(args[6])):
+                if prof_et in ("IFCARBITRARYCLOSEDPROFILEDEF", "IFCARBITRARYPROFILEDEFWITHVOIDS") and len(prof_args) >= 3:
+                    pts2 = _polyline_pts2(_step_ref(prof_args[2]))
+                    if len(pts2) >= 3:
+                        world_pts = [
+                            (cx + px * cdx - py * cdy, cy + px * cdy + py * cdx)
+                            for px, py in pts2
+                        ]
+                        ceilings.append(
+                            {
+                                "id": eid,
+                                "polygon": world_pts,
+                                "base_z_m": cz + pos_loc[2],
+                                "top_z_m": cz + pos_loc[2] + depth,
+                            }
+                        )
 
     return {
         "walls": walls,
         "windows": windows,
         "roofs": roofs,
         "slabs": slabs,
+        "ceilings": ceilings,
         "true_north_deg": true_north_deg,
     }
 
@@ -852,13 +1021,7 @@ def envelope_gates(
         data = model_or_ifc
         resolved_tn = float(data.get("true_north_deg", 0.0) if true_north_deg is None else true_north_deg)
     else:
-        if isinstance(model_or_ifc, Path):
-            ifc_text = model_or_ifc.read_text(encoding="utf-8", errors="replace")
-        elif "\n" in model_or_ifc or "IFC" in model_or_ifc.upper():
-            ifc_text = model_or_ifc
-        else:
-            p = Path(model_or_ifc)
-            ifc_text = p.read_text(encoding="utf-8", errors="replace") if p.exists() else str(model_or_ifc)
+        ifc_text = _read_ifc_source(model_or_ifc)
         data = _extract_model_elements_from_ifc(ifc_text)
         resolved_tn = float(data["true_north_deg"] if true_north_deg is None else true_north_deg)
 
@@ -1484,6 +1647,170 @@ def render_solar_dome_png(
     return str(out_file)
 
 
+def project_shadow_triangles_pure(
+    caster_tris: list[tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]],
+    sun_vec: tuple[float, float, float] | list[float],
+    z_floor: float,
+    ground_rect: tuple[float, float, float, float],
+) -> list[tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]]:
+    """Pure-Python analytical projection of caster triangles along ``-sun_vec`` onto ``z_floor + 0.006``.
+
+    Vertices are clamped to ``ground_rect`` so camera bounds stay identical across frames,
+    triangles entirely at or below the shadow plane are skipped, and every surviving
+    triangle is wound counter-clockwise (``+Z`` normal) for uniform ambient shading.
+    """
+    sx, sy, sz = float(sun_vec[0]), float(sun_vec[1]), float(sun_vec[2])
+    if sz <= 1e-6 or not caster_tris:
+        return []
+
+    zs = float(z_floor) + 0.006
+    gx0, gy0, gx1, gy1 = float(ground_rect[0]), float(ground_rect[1]), float(ground_rect[2]), float(ground_rect[3])
+    out: list[tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]] = []
+
+    for p0, p1, p2 in caster_tris:
+        if max(float(p0[2]), float(p1[2]), float(p2[2])) <= zs + 1e-4:
+            continue
+        proj: list[tuple[float, float, float]] = []
+        for vx, vy, vz in (p0, p1, p2):
+            t = max((float(vz) - zs) / sz, 0.0)
+            px = min(max(float(vx) - t * sx, gx0), gx1)
+            py = min(max(float(vy) - t * sy, gy0), gy1)
+            proj.append((px, py, zs))
+        q0, q1, q2 = proj[0], proj[1], proj[2]
+        nz = (q1[0] - q0[0]) * (q2[1] - q0[1]) - (q1[1] - q0[1]) * (q2[0] - q0[0])
+        if abs(nz) <= 1e-6:
+            continue
+        if nz < 0.0:
+            q1, q2 = q2, q1
+        out.append((q0, q1, q2))
+    return out
+
+
+def build_shadow_mesh(
+    caster_tris: Any,
+    sun_vec: tuple[float, float, float] | list[float],
+    z_floor: float,
+    ground_rect: tuple[float, float, float, float],
+) -> Any:
+    """Vectorized NumPy/Trimesh projection of caster triangles onto ``z_floor + 0.006``."""
+    import numpy as np  # type: ignore
+    import trimesh  # type: ignore
+
+    tris = np.asarray(caster_tris, dtype=np.float64)
+    s = np.asarray(sun_vec, dtype=np.float64)
+    empty = trimesh.Trimesh(
+        vertices=np.zeros((0, 3), dtype=np.float64),
+        faces=np.zeros((0, 3), dtype=np.int64),
+        process=False,
+    )
+    if tris.size == 0 or s[2] <= 1e-6:
+        return empty
+
+    zs = float(z_floor) + 0.006
+    above = tris[..., 2].max(axis=1) > (zs + 1e-4)
+    tris = tris[above]
+    if len(tris) == 0:
+        return empty
+
+    t = np.maximum((tris[..., 2] - zs) / s[2], 0.0)
+    p = tris - t[..., None] * s
+    gx0, gy0, gx1, gy1 = float(ground_rect[0]), float(ground_rect[1]), float(ground_rect[2]), float(ground_rect[3])
+    p[..., 0] = np.clip(p[..., 0], gx0, gx1)
+    p[..., 1] = np.clip(p[..., 1], gy0, gy1)
+    p[..., 2] = zs
+
+    e1 = p[:, 1] - p[:, 0]
+    e2 = p[:, 2] - p[:, 0]
+    nz = e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0]
+    keep = np.abs(nz) > 1e-6
+    p, nz = p[keep], nz[keep]
+    if len(p) == 0:
+        return empty
+
+    flip = nz < 0.0
+    p[flip] = p[flip][:, [0, 2, 1]]
+    faces = np.arange(len(p) * 3, dtype=np.int64).reshape(-1, 3)
+    return trimesh.Trimesh(vertices=p.reshape(-1, 3), faces=faces, process=False)
+
+
+def _mesh_bounds_xyz(mesh: Any) -> tuple[float, float, float, float, float, float] | None:
+    """Return ``(xmin, ymin, zmin, xmax, ymax, zmax)`` for a mesh with NumPy or plain-Python vertices."""
+    verts = getattr(mesh, "vertices", None)
+    if verts is None or len(verts) == 0:
+        return None
+    if hasattr(verts, "min") and hasattr(verts, "max"):
+        bmin = verts.min(axis=0)
+        bmax = verts.max(axis=0)
+        return (
+            float(bmin[0]),
+            float(bmin[1]),
+            float(bmin[2]),
+            float(bmax[0]),
+            float(bmax[1]),
+            float(bmax[2]),
+        )
+    xs = [float(v[0]) for v in verts]
+    ys = [float(v[1]) for v in verts]
+    zs = [float(v[2]) for v in verts]
+    return (min(xs), min(ys), min(zs), max(xs), max(ys), max(zs))
+
+
+def _select_shadow_casters(
+    labeled_meshes: list[tuple[str, Any, Any]],
+    z_floor: float,
+) -> tuple[list[Any], bool, tuple[float, float, float, float, float] | None]:
+    """Filter opaque shadow casters (excluding ``IfcWindow``) and detect missing roof casters."""
+    casters: list[Any] = []
+    wall_bounds: list[tuple[float, float, float, float, float, float]] = []
+    all_bounds: list[tuple[float, float, float, float, float, float]] = []
+
+    for ifc_cls, mesh, _ in labeled_meshes:
+        bounds = _mesh_bounds_xyz(mesh)
+        if bounds is not None:
+            all_bounds.append(bounds)
+            if ifc_cls.startswith("IfcWall"):
+                wall_bounds.append(bounds)
+        faces = getattr(mesh, "faces", None)
+        n_faces = len(faces) if faces is not None else 0
+        if not ifc_cls.startswith("IfcWindow") and n_faces > 0:
+            casters.append(mesh)
+
+    if wall_bounds:
+        rx0 = min(b[0] for b in wall_bounds)
+        ry0 = min(b[1] for b in wall_bounds)
+        rx1 = max(b[3] for b in wall_bounds)
+        ry1 = max(b[4] for b in wall_bounds)
+        roof_z = max(b[5] for b in wall_bounds)
+    elif all_bounds:
+        rx0 = min(b[0] for b in all_bounds)
+        ry0 = min(b[1] for b in all_bounds)
+        rx1 = max(b[3] for b in all_bounds)
+        ry1 = max(b[4] for b in all_bounds)
+        roof_z = max(b[5] for b in all_bounds)
+    else:
+        return casters, False, None
+
+    has_roof = any(ifc_cls.startswith("IfcRoof") for ifc_cls, _, _ in labeled_meshes)
+    if not has_roof:
+        for ifc_cls, mesh, _ in labeled_meshes:
+            if not ifc_cls.startswith("IfcSlab"):
+                continue
+            sb = _mesh_bounds_xyz(mesh)
+            if sb is not None and sb[5] >= float(z_floor) + 1.0 and sb[5] >= roof_z - 0.65:
+                has_roof = True
+                break
+
+    roof_assumed = not has_roof
+    roof_spec = (rx0, ry0, rx1, ry1, roof_z) if (roof_assumed and all_bounds) else None
+    return casters, roof_assumed, roof_spec
+
+
+def _format_shadow_frame_label(pos: SolarPosition, *, roof_assumed: bool) -> str:
+    """Format the frame banner label, flagging assumed roofs."""
+    txt = f"{_fmt_hhmm(pos.hour_solar)} solar  |  Alt {pos.altitude_deg:.0f}° Az {pos.azimuth_deg:.0f}°"
+    return f"{txt}  |  roof assumed" if roof_assumed else txt
+
+
 def render_solstice_shadow_gif(
     ifc_path: str | Path,
     out_gif_path: str | Path,
@@ -1494,28 +1821,104 @@ def render_solstice_shadow_gif(
     width: int = 512,
     height: int = 384,
     duration_ms: int = 240,
+    min_altitude_deg: float = 8.0,
+    ground_pad_m: float = 7.0,
+    step_minutes: int = 60,
 ) -> str:
-    """Render an animated hourly shadow-sweep GIF across daylight hours for the selected city & date."""
-    from PIL import ImageDraw
+    """Render an animated solar shadow-sweep GIF across daylight hours for the selected city & date.
 
-    from .studio_render import _filter_meshes_for_camera, _load_ifc_scene_and_meshes, _rasterize_camera_views
+    Projects every opaque caster (excluding ``IfcWindow`` so daylight enters wall openings)
+    along ``-sun_vec`` onto a padded ground plane at ``z_floor + 0.006``, keeping camera bounds
+    and ``px_scale`` constant across frames. When no ``IfcRoof`` or top ``IfcSlab`` exists, a
+    caster-only roof-height quad is added (never drawn) and labeled ``"roof assumed"``.
+
+    Note:
+        Walls are shaded by face angle only and do not receive cast shadows yet (interior wall
+        faces of a roofed room may still appear angle-lit).
+    """
+    import numpy as np  # type: ignore
+    from PIL import ImageDraw, ImageFont  # type: ignore
+    import trimesh  # type: ignore
+
+    from .studio_render import (
+        _build_synthetic_floor_meshes,
+        _filter_meshes_for_camera,
+        _load_ifc_scene_and_metadata,
+        _rasterize_camera_views,
+    )
 
     resolved_tn = read_ifc_true_north_deg(ifc_path) if true_north_deg is None else float(true_north_deg)
-    _, labeled_meshes, storey_elevations_m = _load_ifc_scene_and_meshes(ifc_path)
-    meshes = _filter_meshes_for_camera(labeled_meshes, "isometric_cutaway")
-    positions, _, _ = solar_day_arc(
+    _, labeled_meshes, storey_elevations_m, space_boxes = _load_ifc_scene_and_metadata(ifc_path)
+    display_meshes = _filter_meshes_for_camera(labeled_meshes, "isometric_cutaway") + _build_synthetic_floor_meshes(
+        labeled_meshes,
+        storey_elevations_m,
+        space_boxes,
+    )
+
+    non_empty_verts = [m.vertices for _, m, _ in labeled_meshes if len(m.vertices) > 0]
+    if non_empty_verts:
+        all_v = np.vstack(non_empty_verts)
+        bmin = all_v.min(axis=0)
+        bmax = all_v.max(axis=0)
+    else:
+        bmin = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+        bmax = np.array([10.0, 8.0, 3.0], dtype=np.float64)
+
+    z_floor = float(storey_elevations_m[0]) if storey_elevations_m else float(bmin[2])
+    pad = float(ground_pad_m)
+    gx0, gy0 = float(bmin[0]) - pad, float(bmin[1]) - pad
+    gx1, gy1 = float(bmax[0]) + pad, float(bmax[1]) + pad
+    ground_rect = (gx0, gy0, gx1, gy1)
+
+    def _quad(x0: float, y0: float, x1: float, y1: float, z: float) -> Any:
+        verts = np.array([[x0, y0, z], [x1, y0, z], [x1, y1, z], [x0, y1, z]], dtype=np.float64)
+        faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
+        return trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+
+    ground_mesh = _quad(gx0, gy0, gx1, gy1, z_floor - 0.03)
+    ground_rgb = np.array([224.0, 216.0, 198.0], dtype=np.float64)
+    ground_rgba = (224, 216, 198, 255)
+
+    casters, roof_assumed, roof_spec = _select_shadow_casters(labeled_meshes, z_floor)
+    if roof_spec is not None:
+        casters.append(_quad(*roof_spec))
+
+    if casters:
+        caster_tris = np.concatenate([m.vertices[m.faces] for m in casters], axis=0)
+    else:
+        caster_tris = np.zeros((0, 3, 3), dtype=np.float64)
+
+    all_positions, _, _ = solar_day_arc(
         lat_deg,
         day_of_year,
-        step_minutes=60,
+        step_minutes=step_minutes,
         true_north_deg=resolved_tn,
     )
+    positions = [p for p in all_positions if p.altitude_deg >= float(min_altitude_deg)]
     if not positions:
-        positions = [solar_position(lat_deg, day_of_year, 12.0, true_north_deg=resolved_tn)]
+        if all_positions:
+            positions = [max(all_positions, key=lambda p: p.altitude_deg)]
+        else:
+            positions = [solar_position(lat_deg, day_of_year, 12.0, true_north_deg=resolved_tn)]
+
+    try:
+        label_font = ImageFont.load_default(size=13)
+    except TypeError:
+        label_font = ImageFont.load_default()
 
     frames = []
     for pos in positions:
+        lit = 0.25 + 0.75 * max(float(pos.sun_vec[2]), 0.0)
+        shade_rgb = np.clip(ground_rgb * 0.34 / lit * np.array([0.90, 0.95, 1.10]), 0.0, 255.0)
+        shadow_rgba = (int(shade_rgb[0]), int(shade_rgb[1]), int(shade_rgb[2]), 255)
+        s_mesh = build_shadow_mesh(caster_tris, pos.sun_vec, z_floor, ground_rect)
+
+        frame_meshes = [(ground_mesh, ground_rgba), *display_meshes]
+        if len(s_mesh.faces) > 0:
+            frame_meshes.append((s_mesh, shadow_rgba))
+
         _, clay_pil = _rasterize_camera_views(
-            meshes,
+            frame_meshes,
             camera_preset="isometric_cutaway",
             width=width,
             height=height,
@@ -1523,12 +1926,16 @@ def render_solstice_shadow_gif(
             light_dir_override=pos.sun_vec,
         )
         draw = ImageDraw.Draw(clay_pil)
-        draw.rectangle([10, 10, 265, 36], fill=(20, 23, 28))
-        draw.text(
-            (18, 17),
-            f"{_fmt_hhmm(pos.hour_solar)} solar  |  Alt {pos.altitude_deg:.0f}° Az {pos.azimuth_deg:.0f}°",
-            fill=(255, 224, 130),
-        )
+        txt = _format_shadow_frame_label(pos, roof_assumed=roof_assumed)
+        try:
+            bx0, by0, bx1, by1 = draw.textbbox((18, 15), txt, font=label_font)
+            pill_w = max(265, bx1 + 12)
+            pill_h = max(36, by1 + 8)
+        except Exception:
+            pill_w = max(265, 18 + 7 * len(txt) + 12)
+            pill_h = 36
+        draw.rectangle([10, 10, pill_w, pill_h], fill=(20, 23, 28))
+        draw.text((18, 15), txt, fill=(255, 224, 130), font=label_font)
         frames.append(clay_pil)
 
     out_file = Path(out_gif_path)
@@ -1541,3 +1948,174 @@ def render_solstice_shadow_gif(
         loop=0,
     )
     return str(out_file)
+
+
+def render_solar_control_frame(
+    ifc_path: str | Path,
+    out_dir: str | Path,
+    *,
+    lat_deg: float,
+    day_of_year: int,
+    hour_solar: float,
+    true_north_deg: float | None = None,
+    camera_preset: str = "isometric_cutaway",
+    width: int = 768,
+    height: int = 576,
+    ground_pad_m: float = 7.0,
+    azimuth_override: float | None = None,
+    elevation_override: float | None = None,
+    storey_index: int = 0,
+    scene_cache: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Render synchronized ``depth.png`` + warm/cool ``shadow_clay.png`` and camera-relative solar cues.
+
+    Intended to drive shadow-conditioned ControlNet + Img2Img photoreal renders at any solar hour.
+    Reuses ``scene_cache`` across multiple hours of a time-lapse to avoid reparsing the IFC file.
+    """
+    import numpy as np  # type: ignore
+    import trimesh  # type: ignore
+
+    from .studio_render import (
+        CAMERA_PRESETS,
+        _build_synthetic_floor_meshes,
+        _filter_meshes_for_camera,
+        _load_ifc_scene_and_metadata,
+        _rasterize_camera_views,
+    )
+
+    def _quad(x0: float, y0: float, x1: float, y1: float, z: float) -> Any:
+        verts = np.array([[x0, y0, z], [x1, y0, z], [x1, y1, z], [x0, y1, z]], dtype=np.float64)
+        faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
+        return trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+
+    if scene_cache is not None and "labeled_meshes" in scene_cache:
+        labeled_meshes = scene_cache["labeled_meshes"]
+        storey_elevations_m = scene_cache["storey_elevations_m"]
+        space_boxes = scene_cache["space_boxes"]
+        wall_segments = scene_cache["wall_segments"]
+        resolved_tn_default = scene_cache["resolved_tn_default"]
+        bmin = scene_cache["bmin"]
+        bmax = scene_cache["bmax"]
+        caster_tris = scene_cache["caster_tris"]
+        roof_assumed = scene_cache["roof_assumed"]
+    else:
+        _, labeled_meshes, storey_elevations_m, space_boxes = _load_ifc_scene_and_metadata(ifc_path)
+        ifc_text = _read_ifc_source(ifc_path)
+        wall_segments = _extract_model_elements_from_ifc(ifc_text).get("walls") or []
+        resolved_tn_default = read_ifc_true_north_deg(ifc_path)
+
+        non_empty_verts = [m.vertices for _, m, _ in labeled_meshes if len(m.vertices) > 0]
+        if non_empty_verts:
+            all_v = np.vstack(non_empty_verts)
+            bmin = all_v.min(axis=0)
+            bmax = all_v.max(axis=0)
+        else:
+            bmin = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+            bmax = np.array([10.0, 8.0, 3.0], dtype=np.float64)
+
+        z0_ref = float(storey_elevations_m[0]) if storey_elevations_m else float(bmin[2])
+        casters, roof_assumed, roof_spec = _select_shadow_casters(labeled_meshes, z0_ref)
+        if roof_spec is not None:
+            casters.append(_quad(*roof_spec))
+
+        caster_tris = (
+            np.concatenate([m.vertices[m.faces] for m in casters], axis=0)
+            if casters
+            else np.zeros((0, 3, 3), dtype=np.float64)
+        )
+        if scene_cache is not None:
+            scene_cache.update(
+                {
+                    "labeled_meshes": labeled_meshes,
+                    "storey_elevations_m": storey_elevations_m,
+                    "space_boxes": space_boxes,
+                    "wall_segments": wall_segments,
+                    "resolved_tn_default": resolved_tn_default,
+                    "bmin": bmin,
+                    "bmax": bmax,
+                    "caster_tris": caster_tris,
+                    "roof_assumed": roof_assumed,
+                }
+            )
+
+    resolved_tn = resolved_tn_default if true_north_deg is None else float(true_north_deg)
+    pos = solar_position(lat_deg, day_of_year, hour_solar, true_north_deg=resolved_tn)
+    atmo = describe_solar_lighting_for_camera(pos, {"right": (1.0, 0.0, 0.0), "up": (0.0, 0.0, 1.0), "forward": (0.0, 1.0, 0.0)})
+    sun_tint = atmo["sun_tint_rgb"]
+    shadow_tint = atmo["shadow_tint_rgb"]
+    shadow_ambient = float(atmo["shadow_ambient"])
+
+    def _tint_rgba(rgba: tuple[int, int, int, int], tint: tuple[float, float, float]) -> tuple[int, int, int, int]:
+        return (
+            max(0, min(255, int(round(rgba[0] * tint[0])))),
+            max(0, min(255, int(round(rgba[1] * tint[1])))),
+            max(0, min(255, int(round(rgba[2] * tint[2])))),
+            int(rgba[3]),
+        )
+
+    is_ortho = CAMERA_PRESETS.get(camera_preset, CAMERA_PRESETS["isometric_cutaway"])["projection"] == "ortho"
+    display_meshes = _filter_meshes_for_camera(labeled_meshes, camera_preset) + _build_synthetic_floor_meshes(
+        labeled_meshes,
+        storey_elevations_m,
+        space_boxes,
+    )
+    tinted_display = [(mesh, _tint_rgba(rgba, sun_tint)) for mesh, rgba in display_meshes]
+
+    if is_ortho:
+        z_floor = float(storey_elevations_m[0]) if storey_elevations_m else float(bmin[2])
+        pad = float(ground_pad_m)
+        ground_rect = (float(bmin[0]) - pad, float(bmin[1]) - pad, float(bmax[0]) + pad, float(bmax[1]) + pad)
+        ground_mesh = _quad(ground_rect[0], ground_rect[1], ground_rect[2], ground_rect[3], z_floor - 0.03)
+        ground_rgb = np.array([224.0, 216.0, 198.0], dtype=np.float64)
+        ground_rgba = _tint_rgba((224, 216, 198, 255), sun_tint)
+        frame_meshes = [(ground_mesh, ground_rgba), *tinted_display]
+    else:
+        s_idx = min(max(0, int(storey_index)), len(storey_elevations_m) - 1) if storey_elevations_m else 0
+        z_floor = float(storey_elevations_m[s_idx]) if storey_elevations_m else float(bmin[2])
+        ground_rect = (float(bmin[0]) - 0.5, float(bmin[1]) - 0.5, float(bmax[0]) + 0.5, float(bmax[1]) + 0.5)
+        ground_rgb = np.array([205.0, 202.0, 196.0], dtype=np.float64)
+        frame_meshes = list(tinted_display)
+
+    if pos.altitude_deg > 0.5:
+        s_mesh = build_shadow_mesh(caster_tris, pos.sun_vec, z_floor, ground_rect)
+        if len(s_mesh.faces) > 0:
+            lit = 0.25 + 0.75 * max(float(pos.sun_vec[2]), 0.0)
+            shade_rgb = np.clip(ground_rgb * shadow_ambient / lit * np.array(shadow_tint, dtype=np.float64), 0.0, 255.0)
+            shadow_rgba = (int(shade_rgb[0]), int(shade_rgb[1]), int(shade_rgb[2]), 255)
+            frame_meshes.append((s_mesh, shadow_rgba))
+
+    pose_info: dict[str, Any] = {}
+    depth_pil, clay_pil = _rasterize_camera_views(
+        frame_meshes,
+        camera_preset=camera_preset,
+        width=width,
+        height=height,
+        azimuth_override=azimuth_override,
+        elevation_override=elevation_override,
+        storey_elevations_m=storey_elevations_m,
+        storey_index=storey_index,
+        space_boxes=space_boxes,
+        wall_segments=wall_segments,
+        light_dir_override=pos.sun_vec if pos.altitude_deg > 0.5 else None,
+        pose_out=pose_info,
+    )
+    lighting = describe_solar_lighting_for_camera(pos, pose_info)
+
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    depth_path = out_path / "depth.png"
+    clay_path = out_path / "shadow_clay.png"
+    depth_pil.save(depth_path)
+    clay_pil.save(clay_path)
+
+    return {
+        "depth_path": str(depth_path),
+        "shadow_clay_path": str(clay_path),
+        "solar_position": pos,
+        "lighting": lighting,
+        "roof_assumed": roof_assumed,
+        "pose": pose_info,
+        "camera_fallback": bool(pose_info.get("camera_fallback", False)),
+        "fallback_reason": pose_info.get("fallback_reason"),
+        "forward_hit_m": pose_info.get("forward_hit_m"),
+    }

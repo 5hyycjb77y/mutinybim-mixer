@@ -8,6 +8,7 @@ functions so tests and lightweight tools work without GPU packages.
 
 from __future__ import annotations
 
+from collections import deque
 import math
 from pathlib import Path
 from typing import Any
@@ -156,15 +157,30 @@ MIXTAPE_PRESETS: dict[str, dict[str, Any]] = {
 }
 
 
-def build_render_prompt(user_vibe: str, style_key: str, camera_key: str) -> tuple[str, str]:
-    """Build `(positive_prompt, negative_prompt)` combining user vibe, art direction, and camera framing."""
+def build_render_prompt(
+    user_vibe: str,
+    style_key: str,
+    camera_key: str,
+    *,
+    solar_lighting_cue: str | None = None,
+    solar_negative_cue: str | None = None,
+) -> tuple[str, str]:
+    """Build `(positive_prompt, negative_prompt)` combining user vibe, solar lighting cue, art direction, and camera."""
     style = ART_DIRECTION_PRESETS.get(style_key) or next(iter(ART_DIRECTION_PRESETS.values()))
     cam = CAMERA_PRESETS.get(camera_key) or CAMERA_PRESETS["isometric_cutaway"]
     vibe_clean = " ".join((user_vibe or "").split())[:220]
-    positive = f"{cam['prompt_hint']}, {style['prompt']}"
+    lighting_clean = " ".join((solar_lighting_cue or "").split())[:300].rstrip(", ")
+    if lighting_clean:
+        positive = f"{cam['prompt_hint']}, {lighting_clean}, {style['prompt']}"
+    else:
+        positive = f"{cam['prompt_hint']}, {style['prompt']}"
     if vibe_clean:
         positive = f"{positive}, inspired by: {vibe_clean}"
-    return positive, style["negative"]
+    negative = style["negative"]
+    neg_clean = " ".join((solar_negative_cue or "").split())[:160]
+    if neg_clean:
+        negative = f"{negative}, {neg_clean}"
+    return positive, negative
 
 
 _IFC_CLASS_COLORS: dict[str, tuple[int, int, int, int]] = {
@@ -260,6 +276,272 @@ def _should_skip_ifc_class(ifc_cls: str) -> bool:
     return ifc_cls in _SKIP_IFC_CLASSES
 
 
+def derive_rooms_from_walls(
+    walls: list[dict[str, Any]],
+    *,
+    cell_m: float = 0.10,
+) -> list[dict[str, Any]]:
+    """Derive enclosed room bounding boxes and longest sightlines from 2D wall footprints."""
+    from .solar_engine import _dist_point_to_seg_2d
+
+    by_storey: dict[float, list[dict[str, Any]]] = {}
+    for w in walls:
+        if float(w.get("height_m", 3.0)) < 1.5:
+            continue
+        sx, sy = float(w["start"][0]), float(w["start"][1])
+        ex, ey = float(w["end"][0]), float(w["end"][1])
+        if math.hypot(ex - sx, ey - sy) < 0.05:
+            continue
+        base_z = float(w.get("base_z_m", 0.0))
+        by_storey.setdefault(round(base_z * 2.0) / 2.0, []).append(w)
+
+    rooms: list[dict[str, Any]] = []
+    for base_z, s_walls in sorted(by_storey.items()):
+        actual_z = round(min(float(w.get("base_z_m", base_z)) for w in s_walls), 4)
+        xs = [float(w["start"][0]) for w in s_walls] + [float(w["end"][0]) for w in s_walls]
+        ys = [float(w["start"][1]) for w in s_walls] + [float(w["end"][1]) for w in s_walls]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+
+        step = float(cell_m)
+        pad = 2
+        nx = int(math.ceil((max_x - min_x) / step)) + 2 * pad + 1
+        ny = int(math.ceil((max_y - min_y) / step)) + 2 * pad + 1
+        while nx * ny > 250000:
+            step *= 1.5
+            nx = int(math.ceil((max_x - min_x) / step)) + 2 * pad + 1
+            ny = int(math.ceil((max_y - min_y) / step)) + 2 * pad + 1
+
+        x0 = min_x - pad * step
+        y0 = min_y - pad * step
+        wall_grid = [False] * (nx * ny)
+
+        for w in s_walls:
+            ax, ay = float(w["start"][0]), float(w["start"][1])
+            bx, by = float(w["end"][0]), float(w["end"][1])
+            half_t = max(0.5 * float(w.get("thickness_m", 0.20)), 0.75 * step)
+            ix0 = max(0, int(math.floor((min(ax, bx) - half_t - x0) / step)))
+            ix1 = min(nx - 1, int(math.ceil((max(ax, bx) + half_t - x0) / step)))
+            iy0 = max(0, int(math.floor((min(ay, by) - half_t - y0) / step)))
+            iy1 = min(ny - 1, int(math.ceil((max(ay, by) + half_t - y0) / step)))
+            for iy in range(iy0, iy1 + 1):
+                cy = y0 + iy * step
+                row = iy * nx
+                for ix in range(ix0, ix1 + 1):
+                    if wall_grid[row + ix]:
+                        continue
+                    cx = x0 + ix * step
+                    if _dist_point_to_seg_2d(cx, cy, ax, ay, bx, by)[0] <= half_t:
+                        wall_grid[row + ix] = True
+
+        # Flood-fill from outer border to mark exterior free space.
+        ext = [False] * (nx * ny)
+        q: deque[int] = deque()
+        for ix in range(nx):
+            for iy in (0, ny - 1):
+                idx = iy * nx + ix
+                if not wall_grid[idx] and not ext[idx]:
+                    ext[idx] = True
+                    q.append(idx)
+        for iy in range(ny):
+            for ix in (0, nx - 1):
+                idx = iy * nx + ix
+                if not wall_grid[idx] and not ext[idx]:
+                    ext[idx] = True
+                    q.append(idx)
+        while q:
+            cur = q.popleft()
+            cy_i, cx_i = divmod(cur, nx)
+            for dx_i, dy_i in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nx_i, ny_i = cx_i + dx_i, cy_i + dy_i
+                if 0 <= nx_i < nx and 0 <= ny_i < ny:
+                    nidx = ny_i * nx + nx_i
+                    if not wall_grid[nidx] and not ext[nidx]:
+                        ext[nidx] = True
+                        q.append(nidx)
+
+        seen = [False] * (nx * ny)
+        for start_iy in range(ny):
+            for start_ix in range(nx):
+                s_idx = start_iy * nx + start_ix
+                if wall_grid[s_idx] or ext[s_idx] or seen[s_idx]:
+                    continue
+                comp: list[tuple[int, int]] = []
+                seen[s_idx] = True
+                cq: deque[int] = deque([s_idx])
+                while cq:
+                    cur = cq.popleft()
+                    cy_i, cx_i = divmod(cur, nx)
+                    comp.append((cx_i, cy_i))
+                    for dx_i, dy_i in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                        nx_i, ny_i = cx_i + dx_i, cy_i + dy_i
+                        if 0 <= nx_i < nx and 0 <= ny_i < ny:
+                            nidx = ny_i * nx + nx_i
+                            if not wall_grid[nidx] and not ext[nidx] and not seen[nidx]:
+                                seen[nidx] = True
+                                cq.append(nidx)
+
+                area_m2 = len(comp) * step * step
+                if area_m2 < 1.5:
+                    continue
+
+                comp_set = set(comp)
+                min_ix = min(c[0] for c in comp)
+                max_ix = max(c[0] for c in comp)
+                min_iy = min(c[1] for c in comp)
+                max_iy = max(c[1] for c in comp)
+                r_xmin = x0 + (min_ix - 0.5) * step
+                r_xmax = x0 + (max_ix + 0.5) * step
+                r_ymin = y0 + (min_iy - 0.5) * step
+                r_ymax = y0 + (max_iy + 0.5) * step
+
+                # Compute distance from each free cell to nearest wall/exterior cell.
+                wall_dist: dict[tuple[int, int], int] = {}
+                dq: deque[tuple[int, int]] = deque()
+                for cx_i, cy_i in comp:
+                    for dx_i, dy_i in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                        nb = (cx_i + dx_i, cy_i + dy_i)
+                        if nb not in comp_set:
+                            wall_dist[(cx_i, cy_i)] = 1
+                            dq.append((cx_i, cy_i))
+                            break
+                while dq:
+                    cx_i, cy_i = dq.popleft()
+                    d0 = wall_dist[(cx_i, cy_i)]
+                    for dx_i, dy_i in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                        nb = (cx_i + dx_i, cy_i + dy_i)
+                        if nb in comp_set and nb not in wall_dist:
+                            wall_dist[nb] = d0 + 1
+                            dq.append(nb)
+
+                min_wall_cells = max(1, int(round(0.30 / step)))
+                cands = [c for c in comp if wall_dist.get(c, 0) >= min_wall_cells]
+                if len(cands) < 2:
+                    cands = [c for c in comp if wall_dist.get(c, 0) >= 2] or comp
+
+                # Select extreme directional frontier points from eroded candidates, then find farthest clear sightline.
+                extreme: set[tuple[int, int]] = set()
+                for wx_d in (-2, -1, 0, 1, 2):
+                    for wy_d in (-2, -1, 0, 1, 2):
+                        if wx_d == 0 and wy_d == 0:
+                            continue
+                        best_c = max(cands, key=lambda c: wx_d * c[0] + wy_d * c[1])
+                        extreme.add(best_c)
+                ext_pts = list(extreme)
+
+                def _line_inside_room(c0: tuple[int, int], c1: tuple[int, int]) -> bool:
+                    steps = max(2, int(math.ceil(math.hypot(c1[0] - c0[0], c1[1] - c0[1]) * 2.0)))
+                    for s_k in range(steps + 1):
+                        t = s_k / steps
+                        gx = int(round(c0[0] + t * (c1[0] - c0[0])))
+                        gy = int(round(c0[1] + t * (c1[1] - c0[1])))
+                        if (gx, gy) not in comp_set:
+                            return False
+                    return True
+
+                best_pair: tuple[tuple[int, int], tuple[int, int]] | None = None
+                best_d2 = -1
+                pairs = []
+                for i in range(len(ext_pts)):
+                    for j in range(i + 1, len(ext_pts)):
+                        p, q_pt = ext_pts[i], ext_pts[j]
+                        d2 = (p[0] - q_pt[0]) ** 2 + (p[1] - q_pt[1]) ** 2
+                        pairs.append((d2, p, q_pt))
+                pairs.sort(key=lambda item: item[0], reverse=True)
+                for d2, p, q_pt in pairs:
+                    if _line_inside_room(p, q_pt):
+                        best_pair = (p, q_pt)
+                        best_d2 = d2
+                        break
+
+                if best_pair is None:
+                    ca = (0.5 * (r_xmin + r_xmax), r_ymin + min(0.4, 0.2 * (r_ymax - r_ymin)))
+                    cb = (0.5 * (r_xmin + r_xmax), r_ymax - min(0.4, 0.2 * (r_ymax - r_ymin)))
+                else:
+                    p0, p1 = best_pair
+                    ca = (x0 + p0[0] * step, y0 + p0[1] * step)
+                    cb = (x0 + p1[0] * step, y0 + p1[1] * step)
+                if ca > cb:
+                    ca, cb = cb, ca
+
+                rooms.append(
+                    {
+                        "xmin": round(r_xmin, 3),
+                        "ymin": round(r_ymin, 3),
+                        "xmax": round(r_xmax, 3),
+                        "ymax": round(r_ymax, 3),
+                        "zmin": actual_z,
+                        "area_m2": round(area_m2, 2),
+                        "corner_a": (round(ca[0], 3), round(ca[1], 3)),
+                        "corner_b": (round(cb[0], 3), round(cb[1], 3)),
+                        "sightline_m": round(math.hypot(cb[0] - ca[0], cb[1] - ca[1]), 3),
+                        "source": "wall_grid",
+                    }
+                )
+
+    rooms.sort(key=lambda r: float(r["area_m2"]), reverse=True)
+    return rooms
+
+
+def extract_ifc_room_boxes(ifc_path_or_text: str | Path, *, cell_m: float = 0.10) -> list[dict[str, Any]]:
+    """Extract room bounding boxes and clear sightlines from an IFC 4.3 file or STEP text."""
+    from .solar_engine import _extract_model_elements_from_ifc, _read_ifc_source
+
+    ifc_text = _read_ifc_source(ifc_path_or_text)
+    data = _extract_model_elements_from_ifc(ifc_text)
+    return derive_rooms_from_walls(data.get("walls") or [], cell_m=cell_m)
+
+
+def _resolve_space_boxes(space_boxes: list[dict[str, Any]], ifc_path: str | Path) -> list[dict[str, Any]]:
+    """Return explicit ``IfcSpace`` boxes if present, otherwise derive rooms from IFC walls."""
+    return list(space_boxes) if space_boxes else extract_ifc_room_boxes(ifc_path)
+
+
+def first_wall_hit_distance_m(
+    eye: tuple[float, float, float] | list[float],
+    forward: tuple[float, float, float] | list[float],
+    walls: list[dict[str, Any]],
+) -> float | None:
+    """Return distance (metres) along 3D ray `(eye, forward)` to nearest opaque wall footprint, or `None`."""
+    ex, ey, ez = float(eye[0]), float(eye[1]), float(eye[2])
+    fx, fy = float(forward[0]), float(forward[1])
+    horiz = math.hypot(fx, fy)
+    if horiz < 1e-6:
+        return None
+    rx, ry = fx / horiz, fy / horiz
+
+    best_t2d: float | None = None
+    for w in walls:
+        bz = float(w.get("base_z_m", -1e6))
+        tz = float(w.get("top_z_m", float(w.get("base_z_m", 0.0)) + float(w.get("height_m", 3.0))))
+        if ez < bz - 0.05 or ez > tz + 0.05:
+            continue
+        ax, ay = float(w["start"][0]), float(w["start"][1])
+        bx, by = float(w["end"][0]), float(w["end"][1])
+        dx, dy = bx - ax, by - ay
+        seg_len = math.hypot(dx, dy)
+        if seg_len < 1e-6:
+            continue
+        half_t = 0.5 * float(w.get("thickness_m", 0.20))
+        nx, ny = (-dy / seg_len) * half_t, (dx / seg_len) * half_t
+        c0 = (ax + nx, ay + ny)
+        c1 = (bx + nx, by + ny)
+        c2 = (bx - nx, by - ny)
+        c3 = (ax - nx, ay - ny)
+        for p0, p1 in ((c0, c1), (c1, c2), (c2, c3), (c3, c0)):
+            sx, sy = p1[0] - p0[0], p1[1] - p0[1]
+            denom = rx * sy - ry * sx
+            if abs(denom) < 1e-9:
+                continue
+            qx, qy = p0[0] - ex, p0[1] - ey
+            t = (qx * sy - qy * sx) / denom
+            u = (qx * ry - qy * rx) / denom
+            if t > 0.05 and -1e-6 <= u <= 1.0 + 1e-6:
+                if best_t2d is None or t < best_t2d:
+                    best_t2d = t
+    return None if best_t2d is None else round(best_t2d / horiz, 3)
+
+
 def compute_camera_pose(
     vmin: tuple[float, float, float] | list[float],
     vmax: tuple[float, float, float] | list[float],
@@ -267,13 +549,15 @@ def compute_camera_pose(
     *,
     storey_elevations_m: list[float] | None = None,
     storey_index: int = 0,
-    space_boxes: list[dict[str, float]] | None = None,
+    space_boxes: list[dict[str, Any]] | None = None,
+    wall_segments: list[dict[str, Any]] | None = None,
+    min_clearance_m: float = 3.0,
     width: int = 1024,
     height: int = 768,
     azimuth_override: float | None = None,
     elevation_override: float | None = None,
 ) -> dict[str, Any]:
-    """Compute camera basis, eye/target coordinates, and constant ortho scale."""
+    """Compute camera basis, eye/target coordinates, room clearance metadata, and constant ortho scale."""
     cam = CAMERA_PRESETS.get(camera_preset, CAMERA_PRESETS["isometric_cutaway"])
     vmin_t = (float(vmin[0]), float(vmin[1]), float(vmin[2]))
     vmax_t = (float(vmax[0]), float(vmax[1]), float(vmax[2]))
@@ -298,6 +582,11 @@ def compute_camera_pose(
         math.sin(el),
     )
 
+    camera_source = "ortho_preset"
+    camera_fallback = False
+    fallback_reason: str | None = None
+    forward_hit_m: float | None = None
+
     if cam["projection"] == "perspective":
         if storey_elevations_m:
             s_idx = min(max(0, storey_index), len(storey_elevations_m) - 1)
@@ -306,35 +595,68 @@ def compute_camera_pose(
             storey_z = vmin_t[2]
         eye_z = storey_z + 1.6
 
-        chosen_space: dict[str, float] | None = None
+        candidates: list[tuple[tuple[float, float, float], tuple[float, float, float], str]] = []
         if space_boxes:
             on_storey = [sb for sb in space_boxes if abs(float(sb["zmin"]) - storey_z) < 0.6]
-            candidates = on_storey or list(space_boxes)
-            best_sb = max(
-                candidates,
-                key=lambda sb: max(0.0, float(sb["xmax"]) - float(sb["xmin"]))
-                * max(0.0, float(sb["ymax"]) - float(sb["ymin"])),
+            ordered = sorted(
+                on_storey or list(space_boxes),
+                key=lambda sb: float(sb.get("area_m2") or max(0.0, float(sb["xmax"]) - float(sb["xmin"])) * max(0.0, float(sb["ymax"]) - float(sb["ymin"]))),
+                reverse=True,
             )
-            if (float(best_sb["xmax"]) - float(best_sb["xmin"])) > 1.2 and (
-                float(best_sb["ymax"]) - float(best_sb["ymin"])
-            ) > 1.2:
-                chosen_space = best_sb
-
-        if chosen_space is not None:
-            sx_min = float(chosen_space["xmin"])
-            sy_min = float(chosen_space["ymin"])
-            sx_max = float(chosen_space["xmax"])
-            sy_max = float(chosen_space["ymax"])
-            eye_z = float(chosen_space["zmin"]) + 1.6
-            mx = min(0.8, 0.16 * (sx_max - sx_min))
-            my = min(0.8, 0.16 * (sy_max - sy_min))
-            corner_a = (sx_min + mx, sy_min + my, eye_z)
-            corner_b = (sx_max - mx, sy_max - my, eye_z)
             is_opp = camera_preset == "opposite_interior" or (
                 camera_preset != "eye_level_interior" and (az_deg % 360.0) >= 180.0
             )
-            eye, target = (corner_b, corner_a) if is_opp else (corner_a, corner_b)
+            for sb in ordered:
+                sx_min = float(sb["xmin"])
+                sy_min = float(sb["ymin"])
+                sx_max = float(sb["xmax"])
+                sy_max = float(sb["ymax"])
+                if (sx_max - sx_min) <= 1.2 or (sy_max - sy_min) <= 1.2:
+                    continue
+                rz = float(sb["zmin"]) + 1.6
+                src = str(sb.get("source") or "space_box")
+                if sb.get("corner_a") is not None and sb.get("corner_b") is not None:
+                    ca2 = sb["corner_a"]
+                    cb2 = sb["corner_b"]
+                    c_a = (float(ca2[0]), float(ca2[1]), rz)
+                    c_b = (float(cb2[0]), float(cb2[1]), rz)
+                else:
+                    mx = min(0.8, 0.16 * (sx_max - sx_min))
+                    my = min(0.8, 0.16 * (sy_max - sy_min))
+                    c_a = (sx_min + mx, sy_min + my, rz)
+                    c_b = (sx_max - mx, sy_max - my, rz)
+                mx2 = min(0.8, 0.16 * (sx_max - sx_min))
+                my2 = min(0.8, 0.16 * (sy_max - sy_min))
+                c_c = (sx_min + mx2, sy_max - my2, rz)
+                c_d = (sx_max - mx2, sy_min + my2, rz)
+                primary = [(c_b, c_a), (c_a, c_b), (c_d, c_c), (c_c, c_d)] if is_opp else [(c_a, c_b), (c_b, c_a), (c_c, c_d), (c_d, c_c)]
+                for ce, ct in primary:
+                    candidates.append((ce, ct, src))
+
+        if candidates:
+            chosen: tuple[tuple[float, float, float], tuple[float, float, float], str, float | None] | None = None
+            best_any: tuple[tuple[float, float, float], tuple[float, float, float], str, float | None] | None = None
+            best_hit = -1.0
+            for ce, ct, src in candidates:
+                fwd_cand = _vec_norm(_vec_sub(ct, ce))
+                hit = first_wall_hit_distance_m(ce, fwd_cand, wall_segments) if wall_segments else None
+                if hit is None or hit >= min_clearance_m:
+                    chosen = (ce, ct, src, hit)
+                    break
+                if hit > best_hit:
+                    best_hit = hit
+                    best_any = (ce, ct, src, hit)
+
+            if chosen is not None:
+                eye, target, camera_source, forward_hit_m = chosen
+            elif best_any is not None:
+                eye, target, camera_source, forward_hit_m = best_any
+                camera_fallback = True
+                fallback_reason = "nearest_wall_under_min_clearance"
         else:
+            camera_source = "bbox_fallback"
+            camera_fallback = True
+            fallback_reason = "no_rooms_detected"
             eye = (
                 center[0] - 0.18 * extent * math.cos(az),
                 center[1] - 0.18 * extent * math.sin(az),
@@ -345,6 +667,8 @@ def compute_camera_pose(
                 center[1] + 0.25 * extent * math.sin(az),
                 eye_z,
             )
+            if wall_segments:
+                forward_hit_m = first_wall_hit_distance_m(eye, _vec_norm(_vec_sub(target, eye)), wall_segments)
     else:
         eye = (
             center[0] + cam_dir[0] * (1.8 * extent),
@@ -384,6 +708,10 @@ def compute_camera_pose(
         "cx_world": cx_world,
         "cy_world": cy_world,
         "focal": focal,
+        "camera_source": camera_source,
+        "camera_fallback": camera_fallback,
+        "fallback_reason": fallback_reason,
+        "forward_hit_m": forward_hit_m,
     }
 
 
@@ -397,8 +725,10 @@ def _rasterize_camera_views(
     elevation_override: float | None = None,
     storey_elevations_m: list[float] | None = None,
     storey_index: int = 0,
-    space_boxes: list[dict[str, float]] | None = None,
+    space_boxes: list[dict[str, Any]] | None = None,
+    wall_segments: list[dict[str, Any]] | None = None,
     light_dir_override: tuple[float, float, float] | list[float] | None = None,
+    pose_out: dict[str, Any] | None = None,
 ) -> tuple[Any, Any]:
     """Pure-NumPy headless software z-buffer rasterizer producing `(depth_pil, clay_pil)`."""
     import numpy as np
@@ -419,11 +749,14 @@ def _rasterize_camera_views(
         storey_elevations_m=storey_elevations_m,
         storey_index=storey_index,
         space_boxes=space_boxes,
+        wall_segments=wall_segments,
         width=width,
         height=height,
         azimuth_override=azimuth_override,
         elevation_override=elevation_override,
     )
+    if pose_out is not None:
+        pose_out.update(pose)
     eye = np.array(pose["eye"], dtype=np.float64)
     forward = np.array(pose["forward"], dtype=np.float64)
     right = np.array(pose["right"], dtype=np.float64)
@@ -651,6 +984,8 @@ def _load_ifc_scene_and_metadata(
     if not storey_elevations_m and slab_top_zs:
         storey_elevations_m = [min(slab_top_zs)]
 
+    space_boxes = _resolve_space_boxes(space_boxes, ifc_path)
+
     return scene, labeled_meshes, storey_elevations_m, space_boxes
 
 
@@ -760,17 +1095,21 @@ def ifc_to_glb_and_control(
     camera_preset: str = "isometric_cutaway",
     width: int = 1024,
     height: int = 768,
-) -> dict[str, str | None]:
+) -> dict[str, Any]:
     """Convert an IFC 4.3 file into an interactive ``model.glb`` + headless ``depth.png`` and ``clay.png``."""
+    from .solar_engine import _extract_model_elements_from_ifc
+
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
     scene, labeled_meshes, storey_elevations_m, space_boxes = _load_ifc_scene_and_metadata(ifc_path)
+    wall_segments = _extract_model_elements_from_ifc(Path(ifc_path).read_text(encoding="utf-8", errors="replace")).get("walls") or []
     glb_path = out_path / "model.glb"
     glb_path.write_bytes(scene.export(file_type="glb"))
 
     control_meshes = _filter_meshes_for_camera(labeled_meshes, camera_preset)
     control_meshes = [*control_meshes, *_build_synthetic_floor_meshes(labeled_meshes, storey_elevations_m, space_boxes)]
+    pose_info: dict[str, Any] = {}
     depth_pil, clay_pil = _rasterize_camera_views(
         control_meshes,
         camera_preset=camera_preset,
@@ -778,6 +1117,8 @@ def ifc_to_glb_and_control(
         height=height,
         storey_elevations_m=storey_elevations_m,
         space_boxes=space_boxes,
+        wall_segments=wall_segments,
+        pose_out=pose_info,
     )
     depth_path = out_path / "depth.png"
     clay_path = out_path / "clay.png"
@@ -788,6 +1129,10 @@ def ifc_to_glb_and_control(
         "glb_path": str(glb_path),
         "depth_path": str(depth_path),
         "clay_path": str(clay_path),
+        "camera_source": pose_info.get("camera_source"),
+        "camera_fallback": bool(pose_info.get("camera_fallback", False)),
+        "fallback_reason": pose_info.get("fallback_reason"),
+        "forward_hit_m": pose_info.get("forward_hit_m"),
     }
 
 
@@ -895,9 +1240,12 @@ def render_storyboard_4up(
     height: int = 576,
 ) -> dict[str, Any]:
     """Render a 4-angle presentation board (2x2) locked to a single IFC model."""
+    from .solar_engine import _extract_model_elements_from_ifc
+
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
     _, labeled_meshes, storey_elevations_m, space_boxes = _load_ifc_scene_and_metadata(ifc_path)
+    wall_segments = _extract_model_elements_from_ifc(Path(ifc_path).read_text(encoding="utf-8", errors="replace")).get("walls") or []
     synth_floors = _build_synthetic_floor_meshes(labeled_meshes, storey_elevations_m, space_boxes)
 
     cam_keys = ["isometric_cutaway", "eye_level_interior", "opposite_interior", "corner_axonometric"]
@@ -915,6 +1263,7 @@ def render_storyboard_4up(
             height=height,
             storey_elevations_m=storey_elevations_m,
             space_boxes=space_boxes,
+            wall_segments=wall_segments,
         )
         d_path = out_path / f"depth_{cam_key}.png"
         c_path = out_path / f"clay_{cam_key}.png"
@@ -961,15 +1310,26 @@ def render_photoreal(
     backend: str = "sdxl_depth",
     steps: int = 24,
     seed: int = 42,
+    shadow_init_path: str | Path | None = None,
+    shadow_strength: float = 0.78,
+    solar_lighting_cue: str | None = None,
+    solar_negative_cue: str | None = None,
+    controlnet_scale: float = 0.70,
 ) -> str:
-    """Render a geometry-locked photorealistic image from ``depth.png``."""
+    """Render a geometry-locked photorealistic image from ``depth.png`` + optional shadow-clay init."""
     import torch  # type: ignore
     from PIL import Image
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    positive, negative = build_render_prompt(user_vibe, style_key, camera_key)
+    positive, negative = build_render_prompt(
+        user_vibe,
+        style_key,
+        camera_key,
+        solar_lighting_cue=solar_lighting_cue,
+        solar_negative_cue=solar_negative_cue,
+    )
     control_img = Image.open(control_image_path).convert("RGB")
     gen = torch.Generator(device="cpu").manual_seed(seed)
 
@@ -994,7 +1354,11 @@ def render_photoreal(
             generator=gen,
         ).images[0]
     else:
-        from diffusers import ControlNetModel, StableDiffusionXLControlNetPipeline  # type: ignore
+        from diffusers import (  # type: ignore
+            ControlNetModel,
+            StableDiffusionXLControlNetImg2ImgPipeline,
+            StableDiffusionXLControlNetPipeline,
+        )
 
         pipe = _PIPELINE_CACHE.get("sdxl_depth")
         if pipe is None:
@@ -1011,19 +1375,177 @@ def render_photoreal(
             pipe.enable_model_cpu_offload()
             _PIPELINE_CACHE["sdxl_depth"] = pipe
 
-        image = pipe(
-            prompt=positive,
-            negative_prompt=negative,
-            image=control_img,
-            num_inference_steps=steps,
-            controlnet_conditioning_scale=0.65,
-            generator=gen,
-        ).images[0]
+        if shadow_init_path is not None:
+            img2img_pipe = _PIPELINE_CACHE.get("sdxl_depth_img2img")
+            if img2img_pipe is None:
+                img2img_pipe = StableDiffusionXLControlNetImg2ImgPipeline.from_pipe(pipe)
+                _PIPELINE_CACHE["sdxl_depth_img2img"] = img2img_pipe
+            init_img = Image.open(shadow_init_path).convert("RGB")
+            if init_img.size != control_img.size:
+                init_img = init_img.resize(control_img.size, Image.Resampling.LANCZOS)
+            strength = min(max(float(shadow_strength), 0.35), 0.95)
+            image = img2img_pipe(
+                prompt=positive,
+                negative_prompt=negative,
+                image=init_img,
+                control_image=control_img,
+                strength=strength,
+                num_inference_steps=steps,
+                controlnet_conditioning_scale=float(controlnet_scale),
+                generator=gen,
+            ).images[0]
+        else:
+            image = pipe(
+                prompt=positive,
+                negative_prompt=negative,
+                image=control_img,
+                num_inference_steps=steps,
+                controlnet_conditioning_scale=0.65,
+                generator=gen,
+            ).images[0]
 
     out_file = Path(out_path)
     out_file.parent.mkdir(parents=True, exist_ok=True)
     image.save(out_file)
     return str(out_file)
+
+
+def render_solar_photoreal_timelapse(
+    ifc_path: str | Path,
+    out_dir: str | Path,
+    user_vibe: str,
+    style_key: str,
+    *,
+    lat_deg: float,
+    day_of_year: int,
+    true_north_deg: float | None = None,
+    camera_preset: str = "isometric_cutaway",
+    hours_solar: list[float] | None = None,
+    num_frames: int = 4,
+    render_photoreal_frames: bool = True,
+    backend: str = "sdxl_depth",
+    steps: int = 20,
+    seed: int = 42,
+    width: int = 768,
+    height: int = 576,
+    shadow_strength: float = 0.76,
+    duration_ms: int = 750,
+) -> dict[str, Any]:
+    """Render a multi-hour shadow-conditioned photoreal architectural board + animated GIF."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    from .solar_engine import (
+        _fmt_hhmm,
+        read_ifc_true_north_deg,
+        render_solar_control_frame,
+        select_timelapse_solar_hours,
+    )
+
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    resolved_tn = read_ifc_true_north_deg(ifc_path) if true_north_deg is None else float(true_north_deg)
+    hours = (
+        [float(h) for h in hours_solar]
+        if hours_solar
+        else select_timelapse_solar_hours(
+            lat_deg,
+            day_of_year,
+            num_frames=num_frames,
+            true_north_deg=resolved_tn,
+        )
+    )
+
+    scene_cache: dict[str, Any] = {}
+    frames_meta: list[dict[str, Any]] = []
+    board_imgs: list[str] = []
+    board_caps: list[str] = []
+    gif_frames = []
+
+    try:
+        hud_font = ImageFont.load_default(size=14)
+    except TypeError:
+        hud_font = ImageFont.load_default()
+
+    for idx, hr in enumerate(hours):
+        f_dir = out_path / f"hour_{idx:02d}"
+        ctrl = render_solar_control_frame(
+            ifc_path,
+            f_dir,
+            lat_deg=lat_deg,
+            day_of_year=day_of_year,
+            hour_solar=hr,
+            true_north_deg=resolved_tn,
+            camera_preset=camera_preset,
+            width=width,
+            height=height,
+            scene_cache=scene_cache,
+        )
+        lighting = ctrl["lighting"]
+        if render_photoreal_frames:
+            shot_path = render_photoreal(
+                ctrl["depth_path"],
+                user_vibe,
+                style_key,
+                camera_preset,
+                f_dir / "render.png",
+                backend=backend,
+                steps=steps,
+                seed=seed,
+                shadow_init_path=ctrl["shadow_clay_path"],
+                shadow_strength=shadow_strength,
+                solar_lighting_cue=lighting["prompt_cue"],
+                solar_negative_cue=lighting["negative_cue"],
+            )
+        else:
+            shot_path = ctrl["shadow_clay_path"]
+
+        cap = f"{_fmt_hhmm(hr)} solar  |  Alt {lighting['altitude_deg']:.0f}° Az {lighting['azimuth_deg']:.0f}°"
+        if ctrl["roof_assumed"]:
+            cap = f"{cap}  |  roof assumed"
+        board_imgs.append(shot_path)
+        board_caps.append(cap)
+        frames_meta.append(
+            {
+                "hour_solar": hr,
+                "shot_path": shot_path,
+                "depth_path": ctrl["depth_path"],
+                "shadow_clay_path": ctrl["shadow_clay_path"],
+                "lighting": lighting,
+                "roof_assumed": ctrl["roof_assumed"],
+            }
+        )
+
+        pil_im = Image.open(shot_path).convert("RGB")
+        draw = ImageDraw.Draw(pil_im)
+        try:
+            _, _, bx1, by1 = draw.textbbox((18, 15), cap, font=hud_font)
+            pill_w = max(270, bx1 + 12)
+            pill_h = max(36, by1 + 8)
+        except Exception:
+            pill_w = max(270, 18 + 8 * len(cap) + 12)
+            pill_h = 36
+        draw.rectangle([10, 10, pill_w, pill_h], fill=(20, 23, 28))
+        draw.text((18, 15), cap, fill=(255, 224, 130), font=hud_font)
+        gif_frames.append(pil_im)
+
+    cols = 2 if len(board_imgs) >= 2 else 1
+    board_path = compose_grid(board_imgs, board_caps, out_path / "solar_photoreal_board.png", cols=cols)
+    gif_path = out_path / "solar_photoreal_timelapse.gif"
+    gif_frames[0].save(
+        gif_path,
+        save_all=True,
+        append_images=gif_frames[1:],
+        duration=duration_ms,
+        loop=0,
+    )
+    return {
+        "board_path": board_path,
+        "gif_path": str(gif_path),
+        "frames": frames_meta,
+        "hours_solar": hours,
+        "roof_assumed": bool(frames_meta and frames_meta[0]["roof_assumed"]),
+        "camera_fallback": bool(frames_meta and scene_cache and any(f.get("camera_fallback") for f in frames_meta)),
+    }
 
 
 def svg_to_png(svg_text: str, out_path: str | Path, *, output_width: int = 1280) -> str:

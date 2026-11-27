@@ -34,6 +34,7 @@ from .solar_engine import (
     KEY_DATES,
     compute_direct_sun_hours_for_points,
     compute_passive_solar_reward,
+    describe_solar_lighting_for_camera,
     envelope_gates,
     render_sun_dial_svg,
     solar_day_arc,
@@ -44,6 +45,7 @@ from .studio_render import (
     CAMERA_PRESETS,
     MIXTAPE_PRESETS,
     build_render_prompt,
+    compute_camera_pose,
 )
 from verifier.verify_client import MutinyVerifierClient
 
@@ -160,13 +162,19 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "build_studio_prompt",
-        "description": "Build depth-conditioned photorealistic positive and negative prompts from user vibe, art direction, and camera preset.",
+        "description": "Build depth-conditioned photorealistic positive and negative prompts from user vibe, art direction, camera preset, and optional solar time/location.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "user_vibe": {"type": "string", "default": ""},
                 "style_key": {"type": "string", "default": "ArchDaily Golden Hour Timber"},
                 "camera_key": {"type": "string", "default": "isometric_cutaway"},
+                "hour_solar": {"type": "number", "description": "Optional solar hour (0..24) to inject camera-relative sun/shadow cues."},
+                "city": {"type": "string"},
+                "lat_deg": {"type": "number"},
+                "date": {"type": "string"},
+                "day_of_year": {"type": "integer"},
+                "true_north_deg": {"type": "number", "default": 0.0},
             },
         },
     },
@@ -411,13 +419,34 @@ def _tool_solar_direct_sun_hours(args: dict[str, Any], *, workspace: Path, **_kw
 def _tool_build_studio_prompt(args: dict[str, Any], **_kw: Any) -> dict[str, Any]:
     style_key = str(args.get("style_key") or "ArchDaily Golden Hour Timber")
     camera_key = str(args.get("camera_key") or "isometric_cutaway")
-    pos, neg = build_render_prompt(str(args.get("user_vibe") or ""), style_key, camera_key)
-    return {
+    solar_lighting: dict[str, Any] | None = None
+    solar_cue: str | None = None
+    solar_neg: str | None = None
+    if args.get("hour_solar") is not None:
+        lat_deg, doy, _, _ = _resolve_lat_doy(args)
+        tn = float(args.get("true_north_deg") or 0.0)
+        pos = solar_position(lat_deg, doy, float(args["hour_solar"]), true_north_deg=tn)
+        pose = compute_camera_pose((0.0, 0.0, 0.0), (12.0, 8.0, 3.5), camera_key)
+        solar_lighting = describe_solar_lighting_for_camera(pos, pose)
+        solar_cue = solar_lighting["prompt_cue"]
+        solar_neg = solar_lighting["negative_cue"]
+
+    pos_p, neg_p = build_render_prompt(
+        str(args.get("user_vibe") or ""),
+        style_key,
+        camera_key,
+        solar_lighting_cue=solar_cue,
+        solar_negative_cue=solar_neg,
+    )
+    out: dict[str, Any] = {
         "style_key": style_key,
         "camera_key": camera_key,
-        "positive_prompt": pos,
-        "negative_prompt": neg,
+        "positive_prompt": pos_p,
+        "negative_prompt": neg_p,
     }
+    if solar_lighting is not None:
+        out["solar_lighting"] = solar_lighting
+    return out
 
 
 def _tool_check_adapter_compatibility(args: dict[str, Any], *, repo_root: Path, workspace: Path, **_kw: Any) -> dict[str, Any]:
