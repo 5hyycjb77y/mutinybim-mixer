@@ -1647,6 +1647,676 @@ def render_solar_dome_png(
     return str(out_file)
 
 
+_EPW_MONTH_OFFSETS = (0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334)
+
+
+def _equation_of_time_min(day_of_year: int) -> float:
+    """Approximate equation of time in minutes (apparent solar minus mean solar time), within about ±1 min."""
+    b = 2.0 * math.pi * (int(day_of_year) - 81) / 364.0
+    return 9.87 * math.sin(2.0 * b) - 7.53 * math.cos(b) - 1.5 * math.sin(b)
+
+
+def _standard_to_solar_time(
+    hour_standard: float, day_of_year: int, lon_deg: float, tz_offset_h: float
+) -> tuple[int, float]:
+    """Convert local standard clock time to local apparent solar time as ``(day_of_year, hour_solar)``.
+
+    EPW hours are local standard time (no daylight saving), while every sun position in this module is
+    in local solar time. The offset is ``4 min per degree * (lon - 15 * tz) + equation of time``; sites far
+    from their zone meridian (e.g. Madrid at -3.7 deg on UTC+1) are off by more than an hour without it.
+    """
+    doy = int(day_of_year)
+    hour_solar = float(hour_standard) + (4.0 * (float(lon_deg) - 15.0 * float(tz_offset_h)) + _equation_of_time_min(doy)) / 60.0
+    if hour_solar < 0.0:
+        hour_solar += 24.0
+        doy = 365 if doy <= 1 else doy - 1
+    elif hour_solar >= 24.0:
+        hour_solar -= 24.0
+        doy = 1 if doy >= 365 else doy + 1
+    return doy, hour_solar
+_TREGENZA_BANDS: tuple[tuple[float, float, int], ...] = (
+    (0.0, 12.0, 30),
+    (12.0, 24.0, 30),
+    (24.0, 36.0, 24),
+    (36.0, 48.0, 24),
+    (48.0, 60.0, 18),
+    (60.0, 72.0, 12),
+    (72.0, 84.0, 6),
+    (84.0, 90.0, 1),
+)
+
+
+def build_tregenza_sky_patches(*, true_north_deg: float = 0.0) -> list[dict[str, Any]]:
+    """Return the standard 145-patch Tregenza sky discretization rotated into IFC model coordinates."""
+    patches: list[dict[str, Any]] = []
+    idx = 0
+    tn = float(true_north_deg)
+    for band_idx, (alt_bot, alt_top, count) in enumerate(_TREGENZA_BANDS):
+        omega_sr = (2.0 * math.pi / count) * (
+            math.sin(math.radians(alt_top)) - math.sin(math.radians(alt_bot))
+        )
+        alt_mid = 90.0 if count == 1 else 0.5 * (alt_bot + alt_top)
+        alt_rad = math.radians(alt_mid)
+        cos_alt = math.cos(alt_rad)
+        sin_alt = math.sin(alt_rad)
+        d_az = 360.0 / count
+        for k in range(count):
+            az_true = (k * d_az) % 360.0
+            az_model_rad = math.radians((az_true + tn) % 360.0)
+            dx = cos_alt * math.sin(az_model_rad)
+            dy = cos_alt * math.cos(az_model_rad)
+            dz = sin_alt
+            patches.append(
+                {
+                    "index": idx,
+                    "band": band_idx,
+                    "altitude_deg": round(alt_mid, 3),
+                    "azimuth_deg": round(az_true, 3),
+                    "direction": (dx, dy, dz),
+                    "omega_sr": omega_sr,
+                }
+            )
+            idx += 1
+    return patches
+
+
+def _read_epw_source(src: str | Path) -> str:
+    """Read EnergyPlus ``.epw`` weather text from a ``Path``/``str`` path, or pass through inline EPW text."""
+    if isinstance(src, Path):
+        return src.read_text(encoding="utf-8", errors="replace")
+    text = str(src)
+    upper = text.lstrip().upper()
+    if "\n" in text or upper.startswith("LOCATION,"):
+        return text
+    return Path(text).read_text(encoding="utf-8", errors="replace")
+
+
+def parse_epw_weather(epw_path_or_text: str | Path) -> dict[str, Any]:
+    """Parse an EnergyPlus ``.epw`` weather file/string into hourly solar irradiance records."""
+    text = _read_epw_source(epw_path_or_text)
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if len(lines) < 9 or not lines[0].upper().startswith("LOCATION,"):
+        raise ValueError("Invalid EPW weather data: expected LOCATION header and hourly rows.")
+
+    loc = [c.strip() for c in lines[0].split(",")]
+    city = loc[1] if len(loc) > 1 and loc[1] else "Unknown"
+    lat_deg = float(loc[6]) if len(loc) > 6 and loc[6] else 0.0
+    lon_deg = float(loc[7]) if len(loc) > 7 and loc[7] else 0.0
+    tz_offset = float(loc[8]) if len(loc) > 8 and loc[8] else 0.0
+    elevation_m = float(loc[9]) if len(loc) > 9 and loc[9] else 0.0
+
+    records: list[dict[str, Any]] = []
+    for row in lines[8:]:
+        cols = row.split(",")
+        if len(cols) < 16:
+            continue
+        try:
+            month = int(cols[1])
+            day = int(cols[2])
+            hour = int(float(cols[3]))
+            ghi = float(cols[13])
+            dni = float(cols[14])
+            dhi = float(cols[15])
+        except ValueError:
+            continue
+        if not (1 <= month <= 12):
+            continue
+        doy_std = max(1, min(365, _EPW_MONTH_OFFSETS[month - 1] + day))
+        hour_std_mid = max(0.0, min(24.0, float(hour) - 0.5))  # EPW values cover the hour ending at `hour`
+        doy, hour_solar = _standard_to_solar_time(hour_std_mid, doy_std, lon_deg, tz_offset)
+        ghi_clean = 0.0 if ghi >= 9900.0 else max(0.0, ghi)
+        dni_clean = 0.0 if dni >= 9900.0 else max(0.0, dni)
+        dhi_clean = 0.0 if dhi >= 9900.0 else max(0.0, dhi)
+        records.append(
+            {
+                "month": month,
+                "day": day,
+                "day_of_year": doy,
+                "day_of_year_standard": doy_std,
+                "hour_standard": hour_std_mid,
+                "hour_solar": hour_solar,
+                "ghi_wh_m2": ghi_clean,
+                "dni_wh_m2": dni_clean,
+                "dhi_wh_m2": dhi_clean,
+                "weight_days": 1.0,
+            }
+        )
+    return {
+        "city": city,
+        "lat_deg": lat_deg,
+        "lon_deg": lon_deg,
+        "tz_offset": tz_offset,
+        "elevation_m": elevation_m,
+        "records": records,
+    }
+
+
+def _iter_doys(start_doy: int, end_doy: int, day_step: int = 1) -> list[int]:
+    """Enumerate inclusive day-of-year indices supporting wrap-around winter ranges (e.g. 335..59)."""
+    s = max(1, min(365, int(start_doy)))
+    e = max(1, min(365, int(end_doy)))
+    step = max(1, int(day_step))
+    span = (e - s) % 365
+    return [((s - 1 + offset) % 365) + 1 for offset in range(0, span + 1, step)]
+
+
+def generate_clear_sky_hourly_irradiance(
+    lat_deg: float,
+    start_doy: int = 1,
+    end_doy: int = 365,
+    *,
+    start_hour: float = 0.0,
+    end_hour: float = 24.0,
+    day_step: int = 1,
+) -> list[dict[str, Any]]:
+    """Synthesize Meinel/Kasten-Young clear-sky hourly DNI/DHI/GHI records (Wh/m²) without an EPW."""
+    records: list[dict[str, Any]] = []
+    doys = _iter_doys(start_doy, end_doy, day_step=day_step)
+    h0 = float(start_hour)
+    h1 = float(end_hour)
+    for doy in doys:
+        i0 = 1361.0 * (1.0 + 0.033 * math.cos(2.0 * math.pi * doy / 365.0))
+        for hour_idx in range(24):
+            hour_mid = hour_idx + 0.5
+            if hour_mid < h0 or hour_mid > h1:
+                continue
+            pos = solar_position(lat_deg, doy, hour_mid, true_north_deg=0.0)
+            if pos.altitude_deg <= 0.5:
+                continue
+            sin_alt = max(1e-4, math.sin(math.radians(pos.altitude_deg)))
+            am = 1.0 / max(sin_alt + 0.50572 * ((pos.altitude_deg + 6.07995) ** -1.6364), 0.05)
+            dni = i0 * (0.7 ** (am ** 0.678))
+            dhi = max(0.0, 0.11 * i0 * (sin_alt ** 0.85))
+            ghi = dni * sin_alt + dhi
+            records.append(
+                {
+                    "day_of_year": doy,
+                    "hour_solar": hour_mid,
+                    "ghi_wh_m2": ghi,
+                    "dni_wh_m2": dni,
+                    "dhi_wh_m2": dhi,
+                    "weight_days": float(max(1, int(day_step))),
+                }
+            )
+    return records
+
+
+def build_cumulative_sky_matrix(
+    *,
+    lat_deg: float | None = None,
+    start_doy: int = 1,
+    end_doy: int = 365,
+    start_hour: float = 0.0,
+    end_hour: float = 24.0,
+    true_north_deg: float = 0.0,
+    epw_path_or_text: str | Path | None = None,
+    day_step: int = 1,
+) -> dict[str, Any]:
+    """Build a Ladybug/Radiance-style 145-patch Tregenza cumulative sky radiation matrix (kWh/m²)."""
+    tn = float(true_north_deg)
+    patches_raw = build_tregenza_sky_patches(true_north_deg=tn)
+    for p in patches_raw:
+        p["direct_kwh_m2"] = 0.0
+        p["diffuse_kwh_m2"] = 0.0
+        p["total_kwh_m2"] = 0.0
+
+    horiz_weight_sum = sum(p["omega_sr"] * max(0.0, p["direction"][2]) for p in patches_raw)
+    if epw_path_or_text is not None:
+        epw = parse_epw_weather(epw_path_or_text)
+        resolved_lat = float(epw["lat_deg"] if lat_deg is None else lat_deg)
+        doy_set = set(_iter_doys(start_doy, end_doy, day_step=1))
+        h0, h1 = float(start_hour), float(end_hour)
+        # Day and hour windows are calendar/clock time for weather files ("occupied 9-17" means the clock).
+        records = [
+            r
+            for r in epw["records"]
+            if int(r.get("day_of_year_standard", r["day_of_year"])) in doy_set
+            and h0 <= float(r.get("hour_standard", r["hour_solar"])) <= h1
+        ]
+        sky_source = f"epw:{epw['city']}"
+    else:
+        resolved_lat = 37.7749 if lat_deg is None else float(lat_deg)
+        records = generate_clear_sky_hourly_irradiance(
+            resolved_lat,
+            start_doy,
+            end_doy,
+            start_hour=start_hour,
+            end_hour=end_hour,
+            day_step=day_step,
+        )
+        sky_source = "clear_sky_model"
+
+    total_direct_horiz = 0.0
+    total_diffuse_horiz = 0.0
+    total_ghi = 0.0
+
+    for rec in records:
+        w_days = float(rec.get("weight_days", 1.0))
+        dhi_kwh = float(rec["dhi_wh_m2"]) * w_days / 1000.0
+        dni_kwh = float(rec["dni_wh_m2"]) * w_days / 1000.0
+        ghi_kwh = float(rec["ghi_wh_m2"]) * w_days / 1000.0
+
+        pos = solar_position(resolved_lat, int(rec["day_of_year"]), float(rec["hour_solar"]), true_north_deg=tn)
+        if dhi_kwh > 0.0 and horiz_weight_sum > 0.0:
+            scale = dhi_kwh / horiz_weight_sum
+            for p in patches_raw:
+                p["diffuse_kwh_m2"] += p["omega_sr"] * scale
+            total_diffuse_horiz += dhi_kwh
+
+        if pos.altitude_deg > 0.5 and dni_kwh > 0.0:
+            sx, sy, sz = pos.sun_vec
+            best_idx = max(
+                range(len(patches_raw)),
+                key=lambda i: (
+                    patches_raw[i]["direction"][0] * sx
+                    + patches_raw[i]["direction"][1] * sy
+                    + patches_raw[i]["direction"][2] * sz
+                ),
+            )
+            patches_raw[best_idx]["direct_kwh_m2"] += dni_kwh
+            total_direct_horiz += dni_kwh * max(0.0, sz)
+
+        if ghi_kwh > 0.0:
+            total_ghi += ghi_kwh
+        elif pos.altitude_deg > 0.5:
+            total_ghi += dni_kwh * max(0.0, pos.sun_vec[2]) + dhi_kwh
+        else:
+            total_ghi += dhi_kwh
+
+    for p in patches_raw:
+        p["total_kwh_m2"] = p["direct_kwh_m2"] + p["diffuse_kwh_m2"]
+
+    return {
+        "sky_source": sky_source,
+        "lat_deg": resolved_lat,
+        "start_doy": int(start_doy),
+        "end_doy": int(end_doy),
+        "start_hour": float(start_hour),
+        "end_hour": float(end_hour),
+        "true_north_deg": tn,
+        "record_count": len(records),
+        "total_direct_horiz_kwh_m2": round(total_direct_horiz, 3),
+        "total_diffuse_horiz_kwh_m2": round(total_diffuse_horiz, 3),
+        "total_ghi_kwh_m2": round(total_ghi, 3),
+        "horiz_weight_sum": horiz_weight_sum,
+        "patches": patches_raw,
+    }
+
+
+def compute_incident_radiation_for_points(
+    points: list[tuple[float, float, float]],
+    normals: list[tuple[float, float, float]],
+    triangles: list[tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]],
+    sky_matrix: dict[str, Any],
+    *,
+    ground_reflectance: float = 0.0,
+    offset_m: float = 0.02,
+) -> dict[str, list[float]]:
+    """Compute per-surface-point incident radiation (kWh/m²) and Sky View Factor via Tregenza raytracing."""
+    if len(points) != len(normals):
+        raise ValueError("points and normals must have the same length.")
+    n_pts = len(points)
+    if n_pts == 0:
+        return {"total_kwh_m2": [], "direct_kwh_m2": [], "diffuse_kwh_m2": [], "sky_view_factor": []}
+
+    patches = sky_matrix["patches"]
+    svf_denom = float(sky_matrix.get("horiz_weight_sum") or sum(p["omega_sr"] * max(0.0, p["direction"][2]) for p in patches))
+
+    unit_normals: list[tuple[float, float, float]] = []
+    origins_list: list[tuple[float, float, float]] = []
+    off = float(offset_m)
+    for pt, nrm in zip(points, normals):
+        nx, ny, nz = float(nrm[0]), float(nrm[1]), float(nrm[2])
+        mag = math.hypot(nx, math.hypot(ny, nz))
+        if mag < 1e-8:
+            nu = (0.0, 0.0, 1.0)
+        else:
+            nu = (nx / mag, ny / mag, nz / mag)
+        unit_normals.append(nu)
+        origins_list.append((float(pt[0]) + off * nu[0], float(pt[1]) + off * nu[1], float(pt[2]) + off * nu[2]))
+
+    direct_out = [0.0] * n_pts
+    diffuse_out = [0.0] * n_pts
+    svf_num = [0.0] * n_pts
+
+    try:
+        import numpy as np  # type: ignore
+
+        ori_arr = np.asarray(origins_list, dtype=np.float32)
+        if triangles:
+            tri_arr = np.asarray(triangles, dtype=np.float32)
+            v0 = tri_arr[:, 0, :]
+            e1 = tri_arr[:, 1, :] - v0
+            e2 = tri_arr[:, 2, :] - v0
+        else:
+            v0 = e1 = e2 = np.zeros((0, 3), dtype=np.float32)
+
+        for p in patches:
+            dx, dy, dz = p["direction"]
+            p_dir = float(p["direct_kwh_m2"])
+            p_dif = float(p["diffuse_kwh_m2"])
+            p_omg = float(p["omega_sr"])
+            active_idxs: list[int] = []
+            active_cos: list[float] = []
+            for i, nu in enumerate(unit_normals):
+                cos_t = nu[0] * dx + nu[1] * dy + nu[2] * dz
+                if cos_t > 1e-6:
+                    active_idxs.append(i)
+                    active_cos.append(cos_t)
+            if not active_idxs:
+                continue
+            blocked = _ray_triangle_any_hit(ori_arr[active_idxs], (dx, dy, dz), v0, e1, e2, min_t=0.01)
+            for idx, cos_t, is_blk in zip(active_idxs, active_cos, blocked):
+                if not bool(is_blk):
+                    direct_out[idx] += p_dir * cos_t
+                    diffuse_out[idx] += p_dif * cos_t
+                    svf_num[idx] += p_omg * cos_t
+    except ImportError:
+        for p in patches:
+            dx, dy, dz = p["direction"]
+            p_dir = float(p["direct_kwh_m2"])
+            p_dif = float(p["diffuse_kwh_m2"])
+            p_omg = float(p["omega_sr"])
+            active_idxs = []
+            active_cos = []
+            active_origins = []
+            for i, nu in enumerate(unit_normals):
+                cos_t = nu[0] * dx + nu[1] * dy + nu[2] * dz
+                if cos_t > 1e-6:
+                    active_idxs.append(i)
+                    active_cos.append(cos_t)
+                    active_origins.append(origins_list[i])
+            if not active_idxs:
+                continue
+            blocked = _ray_triangle_any_hit_pure(active_origins, (dx, dy, dz), triangles, min_t=0.01)
+            for idx, cos_t, is_blk in zip(active_idxs, active_cos, blocked):
+                if not is_blk:
+                    direct_out[idx] += p_dir * cos_t
+                    diffuse_out[idx] += p_dif * cos_t
+                    svf_num[idx] += p_omg * cos_t
+
+    alb = max(0.0, min(1.0, float(ground_reflectance)))
+    ghi_tot = float(sky_matrix.get("total_ghi_kwh_m2", 0.0))
+    if alb > 0.0 and ghi_tot > 0.0:
+        for idx, nu in enumerate(unit_normals):
+            ground_vf = 0.5 * max(0.0, 1.0 - nu[2])
+            diffuse_out[idx] += ghi_tot * alb * ground_vf
+
+    total_out = [round(d + f, 3) for d, f in zip(direct_out, diffuse_out)]
+    svf_out = [round(min(1.0, max(0.0, val / svf_denom)), 4) if svf_denom > 0.0 else 0.0 for val in svf_num]
+    return {
+        "total_kwh_m2": total_out,
+        "direct_kwh_m2": [round(d, 3) for d in direct_out],
+        "diffuse_kwh_m2": [round(f, 3) for f in diffuse_out],
+        "sky_view_factor": svf_out,
+    }
+
+
+def _subdivide_triangle_pure(
+    p0: tuple[float, float, float],
+    p1: tuple[float, float, float],
+    p2: tuple[float, float, float],
+    max_edge_m: float,
+    *,
+    depth: int = 0,
+    max_depth: int = 5,
+) -> list[tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]]:
+    """Subdivide a triangle recursively along its longest edge until edges are <= ``max_edge_m``."""
+    e01 = math.dist(p0, p1)
+    e12 = math.dist(p1, p2)
+    e20 = math.dist(p2, p0)
+    longest = max(e01, e12, e20)
+    if depth >= max_depth or longest <= float(max_edge_m):
+        return [(p0, p1, p2)]
+    if e01 >= e12 and e01 >= e20:
+        mid = (0.5 * (p0[0] + p1[0]), 0.5 * (p0[1] + p1[1]), 0.5 * (p0[2] + p1[2]))
+        return _subdivide_triangle_pure(p0, mid, p2, max_edge_m, depth=depth + 1, max_depth=max_depth) + _subdivide_triangle_pure(
+            mid, p1, p2, max_edge_m, depth=depth + 1, max_depth=max_depth
+        )
+    if e12 >= e01 and e12 >= e20:
+        mid = (0.5 * (p1[0] + p2[0]), 0.5 * (p1[1] + p2[1]), 0.5 * (p1[2] + p2[2]))
+        return _subdivide_triangle_pure(p0, p1, mid, max_edge_m, depth=depth + 1, max_depth=max_depth) + _subdivide_triangle_pure(
+            p0, mid, p2, max_edge_m, depth=depth + 1, max_depth=max_depth
+        )
+    mid = (0.5 * (p2[0] + p0[0]), 0.5 * (p2[1] + p0[1]), 0.5 * (p2[2] + p0[2]))
+    return _subdivide_triangle_pure(p0, p1, mid, max_edge_m, depth=depth + 1, max_depth=max_depth) + _subdivide_triangle_pure(
+        mid, p1, p2, max_edge_m, depth=depth + 1, max_depth=max_depth
+    )
+
+
+def compute_incident_solar_radiation(
+    ifc_path: str | Path,
+    *,
+    lat_deg: float | None = None,
+    start_doy: int = 1,
+    end_doy: int = 365,
+    start_hour: float = 0.0,
+    end_hour: float = 24.0,
+    true_north_deg: float | None = None,
+    epw_path_or_text: str | Path | None = None,
+    max_edge_m: float = 1.5,
+    ground_reflectance: float = 0.2,
+    day_step: int = 1,
+    target_classes: tuple[str, ...] = ("IfcWall", "IfcRoof", "IfcSlab", "IfcWindow"),
+) -> dict[str, Any]:
+    """Compute Ladybug/Ecotect cumulative incident solar radiation (kWh/m²) on IFC model surfaces."""
+    import numpy as np  # type: ignore
+
+    from .studio_render import _load_ifc_scene_and_metadata
+
+    resolved_tn = read_ifc_true_north_deg(ifc_path) if true_north_deg is None else float(true_north_deg)
+    _, labeled_meshes, _, _ = _load_ifc_scene_and_metadata(ifc_path)
+    if not labeled_meshes:
+        raise ValueError(f"No IFC geometry found in {ifc_path}")
+
+    sky = build_cumulative_sky_matrix(
+        lat_deg=lat_deg,
+        start_doy=start_doy,
+        end_doy=end_doy,
+        start_hour=start_hour,
+        end_hour=end_hour,
+        true_north_deg=resolved_tn,
+        epw_path_or_text=epw_path_or_text,
+        day_step=day_step,
+    )
+
+    occluders: list[tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]] = []
+    analysis_tris: list[tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]] = []
+    analysis_classes: list[str] = []
+    analysis_points: list[tuple[float, float, float]] = []
+    analysis_normals: list[tuple[float, float, float]] = []
+    analysis_areas: list[float] = []
+
+    all_verts_list = []
+    for ifc_cls, mesh, _ in labeled_meshes:
+        verts = np.asarray(mesh.vertices, dtype=np.float64)
+        faces = np.asarray(mesh.faces, dtype=np.int64)
+        if len(verts) == 0 or len(faces) == 0:
+            continue
+        all_verts_list.append(verts)
+        is_opaque = not ifc_cls.startswith("IfcWindow")
+        is_target = any(ifc_cls.startswith(prefix) for prefix in target_classes)
+        for f in faces:
+            p0 = (float(verts[f[0], 0]), float(verts[f[0], 1]), float(verts[f[0], 2]))
+            p1 = (float(verts[f[1], 0]), float(verts[f[1], 1]), float(verts[f[1], 2]))
+            p2 = (float(verts[f[2], 0]), float(verts[f[2], 1]), float(verts[f[2], 2]))
+            if is_opaque:
+                occluders.append((p0, p1, p2))
+            if is_target:
+                for sp0, sp1, sp2 in _subdivide_triangle_pure(p0, p1, p2, max_edge_m):
+                    cr = _cross3(_sub3(sp1, sp0), _sub3(sp2, sp0))
+                    cr_mag = math.hypot(cr[0], math.hypot(cr[1], cr[2]))
+                    if cr_mag < 1e-8:
+                        continue
+                    area = 0.5 * cr_mag
+                    normal = (cr[0] / cr_mag, cr[1] / cr_mag, cr[2] / cr_mag)
+                    centroid = (
+                        (sp0[0] + sp1[0] + sp2[0]) / 3.0,
+                        (sp0[1] + sp1[1] + sp2[1]) / 3.0,
+                        (sp0[2] + sp1[2] + sp2[2]) / 3.0,
+                    )
+                    analysis_tris.append((sp0, sp1, sp2))
+                    analysis_classes.append(ifc_cls)
+                    analysis_points.append(centroid)
+                    analysis_normals.append(normal)
+                    analysis_areas.append(area)
+
+    all_v = np.vstack(all_verts_list)
+    vmin = all_v.min(axis=0)
+    vmax = all_v.max(axis=0)
+
+    rad = compute_incident_radiation_for_points(
+        analysis_points,
+        analysis_normals,
+        occluders,
+        sky,
+        ground_reflectance=ground_reflectance,
+    )
+    totals = rad["total_kwh_m2"]
+    directs = rad["direct_kwh_m2"]
+    diffuses = rad["diffuse_kwh_m2"]
+    svfs = rad["sky_view_factor"]
+
+    total_area = sum(analysis_areas)
+    total_incident_kwh = sum(val * area for val, area in zip(totals, analysis_areas))
+    mean_kwh_m2 = total_incident_kwh / total_area if total_area > 0.0 else 0.0
+
+    by_class_acc: dict[str, list[float]] = {}
+    cells: list[dict[str, Any]] = []
+    for cls, pt, area, val in zip(analysis_classes, analysis_points, analysis_areas, totals):
+        bucket = by_class_acc.setdefault(cls, [0.0, 0.0])
+        bucket[0] += val * area
+        bucket[1] += area
+        side_mm = max(200, int(round(math.sqrt(max(area, 0.04)) * 1000.0)))
+        cells.append(
+            {
+                "xMm": int(round(pt[0] * 1000.0)),
+                "yMm": int(round(pt[1] * 1000.0)),
+                "zMm": int(round(pt[2] * 1000.0)),
+                "widthMm": side_mm,
+                "depthMm": side_mm,
+                "value": round(val, 2),
+                "ifcClass": cls,
+            }
+        )
+
+    by_class = {
+        cls: {"area_m2": round(a_sum, 2), "mean_kwh_m2": round(e_sum / a_sum, 2)}
+        for cls, (e_sum, a_sum) in sorted(by_class_acc.items())
+        if a_sum > 0.0
+    }
+    max_val = max(totals) if totals else 1.0
+    overlay = build_scalar_heatmap_overlay(
+        cells,
+        min_value=0.0,
+        max_value=round(max(max_val, 1.0), 2),
+        threshold=None,
+        palette="thermal",
+        opacity=0.82,
+    )
+    overlay["unit"] = "kWh/m2"
+
+    return {
+        "sky_source": sky["sky_source"],
+        "lat_deg": sky["lat_deg"],
+        "start_doy": sky["start_doy"],
+        "end_doy": sky["end_doy"],
+        "start_hour": sky["start_hour"],
+        "end_hour": sky["end_hour"],
+        "true_north_deg": resolved_tn,
+        "surface_triangles": analysis_tris,
+        "surface_classes": analysis_classes,
+        "surface_points": analysis_points,
+        "surface_normals": analysis_normals,
+        "surface_areas_m2": [round(a, 4) for a in analysis_areas],
+        "total_kwh_m2": totals,
+        "direct_kwh_m2": directs,
+        "diffuse_kwh_m2": diffuses,
+        "sky_view_factor": svfs,
+        "min_kwh_m2": round(min(totals), 2) if totals else 0.0,
+        "max_kwh_m2": round(max(totals), 2) if totals else 0.0,
+        "mean_kwh_m2": round(mean_kwh_m2, 2),
+        "total_surface_area_m2": round(total_area, 2),
+        "total_incident_kwh": round(total_incident_kwh, 2),
+        "by_class": by_class,
+        "building_bounds_m": (vmin.tolist(), vmax.tolist()),
+        "overlay": overlay,
+        "assumptions": (
+            f"Ladybug/Ecotect Tregenza 145-patch cumulative incident radiation (kWh/m²) from {sky['sky_source']}; "
+            "cosine-weighted direct + diffuse sky patches with ground reflectance and opaque IFC self-occlusion."
+        ),
+    }
+
+
+def render_incident_radiation_png(
+    rad_result: dict[str, Any],
+    out_png_path: str | Path,
+    *,
+    title: str = "Incident Solar Radiation (kWh/m²)",
+) -> str:
+    """Render a 3D Ladybug/Ecotect false-color surface radiation plot (kWh/m²)."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LinearSegmentedColormap
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+    import numpy as np
+
+    fig = plt.figure(figsize=(10.5, 7.8), dpi=140, facecolor="white")
+    ax = fig.add_subplot(111, projection="3d", facecolor="white")
+
+    tris = np.asarray(rad_result["surface_triangles"], dtype=np.float64)
+    vals = np.asarray(rad_result["total_kwh_m2"], dtype=np.float64)
+    cmap = LinearSegmentedColormap.from_list(
+        "ladybug_rad",
+        ["#1d4ed8", "#06b6d4", "#eab308", "#ea580c", "#dc2626"],
+    )
+    vmax_val = max(float(vals.max()) if len(vals) else 1.0, 1.0)
+    norm = plt.Normalize(vmin=0.0, vmax=vmax_val)
+    if len(tris) > 0:
+        facecolors = cmap(norm(vals))
+        poly = Poly3DCollection(
+            tris,
+            facecolors=facecolors,
+            edgecolors=[(0.15, 0.15, 0.18, 0.18)],
+            linewidths=0.25,
+        )
+        ax.add_collection3d(poly)
+
+    vmin_a = np.asarray(rad_result["building_bounds_m"][0], dtype=np.float64)
+    vmax_a = np.asarray(rad_result["building_bounds_m"][1], dtype=np.float64)
+    cx = 0.5 * (vmin_a[0] + vmax_a[0])
+    cy = 0.5 * (vmin_a[1] + vmax_a[1])
+    span = max(float(np.linalg.norm(vmax_a - vmin_a)), 4.0)
+    half = 0.62 * span
+
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax, shrink=0.58, pad=0.04, aspect=18)
+    cbar.set_label("kWh/m²", fontsize=10, color="#1e293b")
+
+    ax.set_xlim(cx - half, cx + half)
+    ax.set_ylim(cy - half, cy + half)
+    ax.set_zlim(float(vmin_a[2]), float(vmin_a[2]) + span * 0.85)
+    ax.set_box_aspect((1.0, 1.0, 0.55))
+    ax.view_init(elev=32, azim=-48)
+    ax.set_axis_off()
+    ax.set_title(
+        f"{title}  ·  mean {rad_result['mean_kwh_m2']:.0f} kWh/m²  ·  total {rad_result['total_incident_kwh']:.0f} kWh",
+        fontsize=12.0,
+        fontweight="bold",
+        color="#0f172a",
+        pad=8,
+    )
+
+    out_file = Path(out_png_path)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_file, bbox_inches="tight", dpi=140, facecolor="white")
+    plt.close(fig)
+    return str(out_file)
+
+
 def project_shadow_triangles_pure(
     caster_tris: list[tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]],
     sun_vec: tuple[float, float, float] | list[float],

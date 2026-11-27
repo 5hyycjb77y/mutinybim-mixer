@@ -37,12 +37,17 @@ from mixer.solar_engine import (
     _format_shadow_frame_label,
     _read_ifc_source,
     _select_shadow_casters,
+    build_cumulative_sky_matrix,
     build_scalar_heatmap_overlay,
     build_shadow_mesh,
+    build_tregenza_sky_patches,
     compute_direct_sun_hours_for_points,
+    compute_incident_radiation_for_points,
     compute_passive_solar_reward,
     describe_solar_lighting_for_camera,
     envelope_gates,
+    generate_clear_sky_hourly_irradiance,
+    parse_epw_weather,
     project_shadow_triangles_pure,
     read_ifc_true_north_deg,
     render_sun_dial_svg,
@@ -1259,6 +1264,212 @@ ENDSEC;
         self.assertEqual(part_gates["exterior_wall_count"], 4)
         self.assertAlmostEqual(part_gates["facade_wwr"]["S"], 0.25, places=3)
 
+    def test_tregenza_sky_epw_parser_and_incident_radiation_physics(self) -> None:
+        # 1. Tregenza 145 patches cover exact upper hemisphere solid angle 2*pi steradians.
+        patches = build_tregenza_sky_patches()
+        self.assertEqual(len(patches), 145)
+        self.assertAlmostEqual(sum(p["omega_sr"] for p in patches), 2.0 * math.pi, places=6)
+
+        # 2. Synthetic EPW parser: missing str path fails loudly, and Str/Path/Text match on constant diffuse sky.
+        with self.assertRaises(FileNotFoundError):
+            parse_epw_weather("/tmp/nonexistent_weather_999.epw")
+
+        epw_header = [
+            "LOCATION,TestCity,CA,USA,TMY3,724940,37.77,-122.42,-8.0,10.0",
+            "DESIGN CONDITIONS,0",
+            "TYPICAL/EXTREME PERIODS,0",
+            "GROUND TEMPERATURES,0",
+            "HOLIDAYS/DAYLIGHT SAVINGS,No,0,0,0",
+            "COMMENTS 1,Synthetic constant DHI=100 Wh/m2 test",
+            "COMMENTS 2,",
+            "DATA PERIODS,1,1,Data,Sunday, 6/21, 6/21",
+        ]
+        # Jun 21, 24 hours: constant GHI=100, DNI=0, DHI=100 -> 2.4 kWh/m2 horizontal.
+        epw_rows = []
+        for hr in range(1, 25):
+            cols = ["2026", "6", "21", str(hr), "0", "?"] + ["0"] * 7 + ["100", "0", "100"] + ["0"] * 10
+            epw_rows.append(",".join(cols))
+        epw_text = "\n".join(epw_header + epw_rows) + "\n"
+
+        with tempfile.TemporaryDirectory() as td:
+            epw_path = Path(td) / "test.epw"
+            epw_path.write_text(epw_text, encoding="utf-8")
+            parsed_str = parse_epw_weather(str(epw_path))
+            parsed_path = parse_epw_weather(epw_path)
+            parsed_txt = parse_epw_weather(epw_text)
+            self.assertEqual(parsed_str["city"], "TestCity")
+            self.assertEqual(len(parsed_str["records"]), 24)
+            self.assertEqual(parsed_path["records"], parsed_str["records"])
+            self.assertEqual(parsed_txt["records"], parsed_str["records"])
+
+            sky_epw = build_cumulative_sky_matrix(
+                start_doy=172,
+                end_doy=172,
+                epw_path_or_text=str(epw_path),
+            )
+        self.assertTrue(sky_epw["sky_source"].startswith("epw:"))
+        self.assertAlmostEqual(sky_epw["total_diffuse_horiz_kwh_m2"], 2.4, places=4)
+
+        pts_diff = [(0.0, 0.0, 1.0), (0.0, 0.0, 1.0), (0.0, 0.0, 1.0)]
+        nrms_diff = [(0.0, 0.0, 1.0), (0.0, -1.0, 0.0), (0.0, 0.0, -1.0)]  # Roof, Vertical Wall, Downward Soffit
+        rad_no_alb = compute_incident_radiation_for_points(pts_diff, nrms_diff, [], sky_epw, ground_reflectance=0.0)
+        self.assertAlmostEqual(rad_no_alb["total_kwh_m2"][0], 2.4, places=3)
+        self.assertAlmostEqual(rad_no_alb["sky_view_factor"][0], 1.0, places=3)
+        self.assertAlmostEqual(rad_no_alb["total_kwh_m2"][1], 1.2, delta=0.05)
+        self.assertAlmostEqual(rad_no_alb["sky_view_factor"][1], 0.5, delta=0.03)
+        self.assertEqual(rad_no_alb["total_kwh_m2"][2], 0.0)
+        self.assertEqual(rad_no_alb["sky_view_factor"][2], 0.0)
+
+        rad_alb = compute_incident_radiation_for_points(pts_diff, nrms_diff, [], sky_epw, ground_reflectance=0.2)
+        self.assertAlmostEqual(rad_alb["total_kwh_m2"][2], 0.48, places=2)  # 2.4 * 0.2 * 1.0 ground view
+
+        # 3. Clear-sky annual orientation physics:
+        #    Northern hemisphere (SF): Roof > South > East ~= West > North.
+        sky_sf = build_cumulative_sky_matrix(lat_deg=37.7749, start_doy=1, end_doy=365, day_step=15)
+        ori_pts = [(0.0, 0.0, 1.0)] * 5
+        ori_nrms = [
+            (0.0, 0.0, 1.0),   # Roof
+            (0.0, -1.0, 0.0),  # South
+            (1.0, 0.0, 0.0),   # East
+            (-1.0, 0.0, 0.0),  # West
+            (0.0, 1.0, 0.0),   # North
+        ]
+        sf_rad = compute_incident_radiation_for_points(ori_pts, ori_nrms, [], sky_sf)["total_kwh_m2"]
+        sf_roof, sf_s, sf_e, sf_w, sf_n = sf_rad
+        self.assertGreater(sf_roof, sf_s)
+        self.assertGreater(sf_s, sf_e)
+        self.assertGreater(sf_e, sf_n)
+        self.assertAlmostEqual(sf_e, sf_w, delta=max(20.0, 0.05 * sf_e))
+
+        # Southern hemisphere (Sydney): North > South.
+        sky_syd = build_cumulative_sky_matrix(lat_deg=-33.8688, start_doy=1, end_doy=365, day_step=15)
+        syd_rad = compute_incident_radiation_for_points([(0, 0, 1), (0, 0, 1)], [(0, 1, 0), (0, -1, 0)], [], sky_syd)["total_kwh_m2"]
+        self.assertGreater(syd_rad[0], syd_rad[1] * 2.0)
+
+        # True North rotation +90 deg: Plan -X becomes True South and exceeds Plan +X (True North).
+        sky_rot90 = build_cumulative_sky_matrix(lat_deg=37.7749, start_doy=1, end_doy=365, true_north_deg=90.0, day_step=15)
+        rot_rad = compute_incident_radiation_for_points([(0, 0, 1), (0, 0, 1)], [(-1, 0, 0), (1, 0, 0)], [], sky_rot90)["total_kwh_m2"]
+        self.assertGreater(rot_rad[0], rot_rad[1] * 2.0)
+
+        # Wrap-around winter range & lunch hour window return valid positive irradiance.
+        sky_win = build_cumulative_sky_matrix(lat_deg=37.7749, start_doy=350, end_doy=15, start_hour=11.0, end_hour=14.0, day_step=3)
+        self.assertGreater(sky_win["total_ghi_kwh_m2"], 5.0)
+
+        # 4. Occlusion check: closed box reads 0.0 kWh/m2 & SVF=0; overhang shades south wall.
+        def _quad_tris(a, b, c, d):
+            return [(a, b, c), (a, c, d)]
+
+        closed_box = (
+            _quad_tris((-3, -3, 3), (3, -3, 3), (3, 3, 3), (-3, 3, 3))
+            + _quad_tris((-3, -3, 0), (3, -3, 0), (3, -3, 3), (-3, -3, 3))
+            + _quad_tris((3, -3, 0), (3, 3, 0), (3, 3, 3), (3, -3, 3))
+            + _quad_tris((3, 3, 0), (-3, 3, 0), (-3, 3, 3), (3, 3, 3))
+            + _quad_tris((-3, 3, 0), (-3, -3, 0), (-3, -3, 3), (-3, 3, 3))
+        )
+        closed_rad = compute_incident_radiation_for_points([(0.0, 0.0, 1.5)], [(0.0, 0.0, 1.0)], closed_box, sky_sf)
+        self.assertEqual(closed_rad["total_kwh_m2"][0], 0.0)
+        self.assertEqual(closed_rad["sky_view_factor"][0], 0.0)
+
+        overhang = _quad_tris((-3, -2.5, 2.5), (3, -2.5, 2.5), (3, 0.0, 2.5), (-3, 0.0, 2.5))
+        unshaded = compute_incident_radiation_for_points([(0.0, -0.05, 1.2)], [(0.0, -1.0, 0.0)], [], sky_sf)["total_kwh_m2"][0]
+        shaded = compute_incident_radiation_for_points([(0.0, -0.05, 1.2)], [(0.0, -1.0, 0.0)], overhang, sky_sf)["total_kwh_m2"][0]
+        self.assertLess(shaded, unshaded * 0.65)
+
+    def test_epw_standard_time_is_converted_to_solar_time(self) -> None:
+        """A clear sky is symmetric in solar time, so unobstructed east and west facades must match.
+
+        The synthetic EPW labels its hours in local standard time for Madrid (-3.7 deg on UTC+1, 75 min
+        from its zone meridian), using an independent NOAA equation of time. Treating EPW hours as solar
+        time made the west facade read about 75% higher than the east.
+        """
+        def eot_noaa_min(doy: int) -> float:
+            g = 2.0 * math.pi / 365.0 * (doy - 1)
+            return 229.18 * (0.000075 + 0.001868 * math.cos(g) - 0.032077 * math.sin(g)
+                             - 0.014615 * math.cos(2 * g) - 0.040849 * math.sin(2 * g))
+
+        def clear_sky(lat: float, doy: int, t_solar: float) -> tuple[float, float, float]:
+            pos = solar_position(lat, doy, t_solar)
+            if pos.altitude_deg <= 0.5:
+                return 0.0, 0.0, 0.0
+            s = math.sin(math.radians(pos.altitude_deg))
+            i0 = 1361.0 * (1.0 + 0.033 * math.cos(2.0 * math.pi * doy / 365.0))
+            am = 1.0 / max(s + 0.50572 * ((pos.altitude_deg + 6.07995) ** -1.6364), 0.05)
+            dni = i0 * 0.7 ** (am ** 0.678)
+            dhi = 0.11 * i0 * s ** 0.85
+            return dni * s + dhi, dni, dhi
+
+        lat, lon, tz = 40.4168, -3.7038, 1.0
+        rows = [f"LOCATION,Synthetic Madrid,,ES,synthetic,000000,{lat},{lon},{tz},657"] + [f"HEADER{i}" for i in range(7)]
+        month_days = (31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+        doy = 0
+        for month, n_days in enumerate(month_days, start=1):
+            for day in range(1, n_days + 1):
+                doy += 1
+                if day not in (5, 15, 25):
+                    continue
+                for hour in range(1, 25):
+                    t_solar = (hour - 0.5) + (4.0 * (lon - 15.0 * tz) + eot_noaa_min(doy)) / 60.0
+                    ghi, dni, dhi = clear_sky(lat, doy, t_solar)
+                    rows.append(",".join(["1999", str(month), str(day), str(hour), "60", "?"] + ["0"] * 7
+                                         + [f"{ghi:.1f}", f"{dni:.1f}", f"{dhi:.1f}"] + ["0"] * 19))
+        epw_text = "\n".join(rows) + "\n"
+
+        parsed = parse_epw_weather(epw_text)
+        june15 = [r for r in parsed["records"] if r["day_of_year_standard"] == 166 and r["hour_standard"] == 13.5]
+        self.assertEqual(len(june15), 1)
+        # 13:30 clock time in Madrid on 15 June is about 12:15 local solar time (-75 min longitude, ~0 EoT).
+        self.assertAlmostEqual(june15[0]["hour_solar"], 12.25, delta=0.1)
+        # On 5 November the equation of time is about +16 min, so the same clock time is about 12:31 solar.
+        nov5 = [r for r in parsed["records"] if r["day_of_year_standard"] == 309 and r["hour_standard"] == 13.5]
+        self.assertEqual(len(nov5), 1)
+        expected = 13.5 + (4.0 * (lon - 15.0 * tz) + eot_noaa_min(309)) / 60.0
+        self.assertAlmostEqual(nov5[0]["hour_solar"], expected, delta=0.05)
+
+        sky = build_cumulative_sky_matrix(epw_path_or_text=epw_text)
+        east, west, south = compute_incident_radiation_for_points(
+            [(0.0, 0.0, 1.5)] * 3, [(1.0, 0.0, 0.0), (-1.0, 0.0, 0.0), (0.0, -1.0, 0.0)], [], sky
+        )["total_kwh_m2"]
+        self.assertGreater(east, 0.0)
+        self.assertAlmostEqual(west / east, 1.0, delta=0.03, msg=f"east {east} vs west {west}")
+        self.assertGreater(south, east)
+
+        # Occupied-hour windows are clock time for weather files: a 13-14 h window holds exactly the rows
+        # stamped 13:30 standard time (about 12:15 solar in Madrid), not the rows at 13-14 h solar.
+        window = build_cumulative_sky_matrix(epw_path_or_text=epw_text, start_hour=13.0, end_hour=14.0)
+        clock_rows = [r for r in parsed["records"] if 13.0 <= r["hour_standard"] <= 14.0]
+        self.assertEqual(window["record_count"], len(clock_rows))
+        self.assertAlmostEqual(
+            window["total_ghi_kwh_m2"], sum(r["ghi_wh_m2"] for r in clock_rows) / 1000.0, delta=0.01
+        )
+
+    def test_incident_direct_magnitude_and_true_north_rotation(self) -> None:
+        """Absolute kWh/m2 against an exact hourly sum, and the direction of the true-north rotation."""
+        lat = 40.4168
+        recs = generate_clear_sky_hourly_irradiance(lat, 1, 365, day_step=7)
+        exact_direct_roof = sum(
+            r["dni_wh_m2"] * max(0.0, solar_position(lat, r["day_of_year"], r["hour_solar"]).sun_vec[2]) * r["weight_days"]
+            for r in recs
+        ) / 1000.0
+        sky = build_cumulative_sky_matrix(lat_deg=lat, day_step=7)
+        roof = compute_incident_radiation_for_points([(0.0, 0.0, 1.0)], [(0.0, 0.0, 1.0)], [], sky)
+        self.assertAlmostEqual(roof["direct_kwh_m2"][0] / exact_direct_roof, 1.0, delta=0.03)
+        self.assertGreater(exact_direct_roof, 1000.0)  # a sunny mid-latitude roof gets well over 1 MWh/m2 a year
+        self.assertLess(exact_direct_roof, 2500.0)
+
+        # true_north_deg is degrees clockwise from plan +Y: at +90, true north points along model +X.
+        north_patch = next(p for p in build_tregenza_sky_patches(true_north_deg=90.0) if p["band"] == 0 and p["azimuth_deg"] == 0.0)
+        self.assertGreater(north_patch["direction"][0], 0.9)
+        self.assertAlmostEqual(north_patch["direction"][1], 0.0, places=6)
+        unrotated = next(p for p in build_tregenza_sky_patches(true_north_deg=0.0) if p["band"] == 0 and p["azimuth_deg"] == 0.0)
+        self.assertGreater(unrotated["direction"][1], 0.9)
+
+        # ...so true south points along model -X, and that facade is the sunniest of the four.
+        sky_90 = build_cumulative_sky_matrix(lat_deg=lat, day_step=7, true_north_deg=90.0)
+        facades = compute_incident_radiation_for_points(
+            [(0.0, 0.0, 1.5)] * 4, [(1.0, 0.0, 0.0), (-1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, -1.0, 0.0)], [], sky_90
+        )["total_kwh_m2"]
+        self.assertEqual(max(range(4), key=lambda i: facades[i]), 1, facades)
+
 
 class TestSketchEngine(unittest.TestCase):
     def test_all_topologies_generate_valid_scripts_and_bounds(self) -> None:
@@ -1314,7 +1525,7 @@ class TestMixerMcpServer(unittest.TestCase):
         tlist = handle_jsonrpc_message({"jsonrpc": "2.0", "id": 3, "method": "tools/list"})
         names = [t["name"] for t in tlist["result"]["tools"]]
         self.assertEqual(names, [t["name"] for t in TOOLS])
-        self.assertEqual(len(names), 9)
+        self.assertEqual(len(names), 10)
 
         def _call(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             resp = handle_jsonrpc_message(
@@ -1361,6 +1572,20 @@ class TestMixerMcpServer(unittest.TestCase):
         sun_pts = _call("solar_direct_sun_hours", {"points": [[0.0, 0.0, 0.0]], "city": "san_francisco", "date": "spring_equinox", "step_minutes": 30})
         self.assertGreater(sun_pts["point_hours"][0], 11.0)
 
+        rad_pts = _call(
+            "solar_incident_radiation",
+            {
+                "points": [[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]],
+                "normals": [[0.0, 0.0, 1.0], [0.0, -1.0, 0.0]],
+                "city": "san_francisco",
+                "start_doy": 1,
+                "end_doy": 365,
+                "day_step": 30,
+            },
+        )
+        self.assertGreater(rad_pts["total_kwh_m2"][0], rad_pts["total_kwh_m2"][1])
+        self.assertAlmostEqual(rad_pts["sky_view_factor"][0], 1.0, places=2)
+
         pr = _call("build_studio_prompt", {"user_vibe": "Warm cedar library"})
         self.assertIn("Warm cedar library", pr["positive_prompt"])
         self.assertNotIn("solar_lighting", pr)
@@ -1398,7 +1623,7 @@ class TestMixerMcpServer(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         lines = [json.loads(line) for line in proc.stdout.strip().splitlines() if line.strip()]
         self.assertEqual([ln["id"] for ln in lines], [1, 2, 3])
-        self.assertEqual(len(lines[1]["result"]["tools"]), 9)
+        self.assertEqual(len(lines[1]["result"]["tools"]), 10)
         info = json.loads(lines[2]["result"]["content"][0]["text"])
         self.assertEqual(info["spec_version"], "0.1.0")
 
@@ -1411,6 +1636,26 @@ class TestMixerMcpServer(unittest.TestCase):
             outside_ifc = outside / "canary.ifc"
             outside_ifc.write_text("ISO-10303-21;\nDATA;\nENDSEC;\n", encoding="utf-8")
             outside_write = outside / "written-here"
+
+            # Oversized radiation queries are refused before any work starts.
+            big = handle_jsonrpc_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "solar_incident_radiation",
+                        "arguments": {
+                            "lat_deg": 40.0,
+                            "points": [[0.0, 0.0, 1.0]] * 3000,
+                            "triangles": [[[0, 0, 5], [1, 0, 5], [0, 1, 5]]] * 1000,
+                        },
+                    },
+                },
+                workspace=ws,
+            )
+            self.assertTrue(big["result"]["isError"])
+            self.assertIn("Too much work", big["result"]["content"][0]["text"])
 
             # Outside reads must return isError=True.
             r1 = handle_jsonrpc_message(

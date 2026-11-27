@@ -32,7 +32,9 @@ from .sketch_engine import (
 from .solar_engine import (
     CITY_PRESETS,
     KEY_DATES,
+    build_cumulative_sky_matrix,
     compute_direct_sun_hours_for_points,
+    compute_incident_radiation_for_points,
     compute_passive_solar_reward,
     describe_solar_lighting_for_camera,
     envelope_gates,
@@ -157,6 +159,32 @@ TOOLS: list[dict[str, Any]] = [
                 "true_north_deg": {"type": "number"},
                 "step_minutes": {"type": "integer", "default": 30},
                 "grid_spacing_m": {"type": "number", "default": 1.0},
+            },
+        },
+    },
+    {
+        "name": "solar_incident_radiation",
+        "description": "Compute Ladybug/Ecotect Tregenza 145-patch cumulative incident solar radiation (kWh/m²) and Sky View Factor for explicit points/normals (zero-dep) or full IFC model surfaces + 3D PNG.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "points": {"type": "array", "items": {"type": "array", "items": {"type": "number"}}},
+                "normals": {"type": "array", "items": {"type": "array", "items": {"type": "number"}}},
+                "triangles": {"type": "array", "description": "List of 3-vertex triangles [[x,y,z],[x,y,z],[x,y,z]] for explicit point mode."},
+                "ifc_path": {"type": "string", "description": "Path inside the mixer workspace to an .ifc file for full surface radiation mode."},
+                "out_dir": {"type": "string", "description": "Optional output directory inside the mixer workspace for solar_radiation.png and radiation_heatmap.json."},
+                "epw_path": {"type": "string", "description": "Optional EnergyPlus .epw weather file inside workspace."},
+                "epw_text": {"type": "string", "description": "Optional inline EnergyPlus .epw weather text."},
+                "city": {"type": "string"},
+                "lat_deg": {"type": "number"},
+                "start_doy": {"type": "integer", "default": 1},
+                "end_doy": {"type": "integer", "default": 365},
+                "start_hour": {"type": "number", "default": 0.0},
+                "end_hour": {"type": "number", "default": 24.0},
+                "day_step": {"type": "integer", "default": 1},
+                "true_north_deg": {"type": "number"},
+                "ground_reflectance": {"type": "number", "default": 0.2},
+                "max_edge_m": {"type": "number", "default": 1.5},
             },
         },
     },
@@ -416,6 +444,125 @@ def _tool_solar_direct_sun_hours(args: dict[str, Any], *, workspace: Path, **_kw
     return out
 
 
+def _tool_solar_incident_radiation(args: dict[str, Any], *, workspace: Path, **_kw: Any) -> dict[str, Any]:
+    lat_deg, _, _, _ = _resolve_lat_doy(args)
+    start_doy = int(args.get("start_doy", 1))
+    end_doy = int(args.get("end_doy", 365))
+    start_hour = float(args.get("start_hour", 0.0))
+    end_hour = float(args.get("end_hour", 24.0))
+    day_step = max(1, int(args.get("day_step", 1)))
+    tn = float(args["true_north_deg"]) if args.get("true_north_deg") is not None else None
+    ground_reflectance = float(args.get("ground_reflectance", 0.2))
+
+    epw_source: str | Path | None = None
+    if args.get("epw_text"):
+        epw_source = str(args["epw_text"])
+    elif args.get("epw_path"):
+        epw_source = _inside_workspace(str(args["epw_path"]), workspace=workspace, must_exist=True)
+
+    if args.get("points") is not None:
+        n_points = len(args["points"])
+        n_tris = len(args.get("triangles") or [])
+        # Cost is points x triangles x 145 sky patches; keep one call to seconds, not minutes.
+        if n_points > 5000 or n_tris > 20000 or n_points * max(1, n_tris) > 2_000_000:
+            raise ValueError(
+                f"Too much work for one call ({n_points} points x {n_tris} triangles): "
+                "use at most 5000 points, 20000 triangles and 2,000,000 point-triangle pairs."
+            )
+        pts = [(float(p[0]), float(p[1]), float(p[2])) for p in args["points"]]
+        raw_normals = args.get("normals")
+        if raw_normals is None:
+            nrms = [(0.0, 0.0, 1.0) for _ in pts]
+        else:
+            nrms = [(float(n[0]), float(n[1]), float(n[2])) for n in raw_normals]
+        tris = [
+            (
+                (float(t[0][0]), float(t[0][1]), float(t[0][2])),
+                (float(t[1][0]), float(t[1][1]), float(t[1][2])),
+                (float(t[2][0]), float(t[2][1]), float(t[2][2])),
+            )
+            for t in (args.get("triangles") or [])
+        ]
+        resolved_tn = 0.0 if tn is None else tn
+        sky = build_cumulative_sky_matrix(
+            lat_deg=None if (epw_source is not None and args.get("lat_deg") is None and args.get("city") is None) else lat_deg,
+            start_doy=start_doy,
+            end_doy=end_doy,
+            start_hour=start_hour,
+            end_hour=end_hour,
+            true_north_deg=resolved_tn,
+            epw_path_or_text=epw_source,
+            day_step=day_step,
+        )
+        res = compute_incident_radiation_for_points(
+            pts,
+            nrms,
+            tris,
+            sky,
+            ground_reflectance=ground_reflectance,
+        )
+        return {
+            "sky_source": sky["sky_source"],
+            "lat_deg": sky["lat_deg"],
+            "start_doy": sky["start_doy"],
+            "end_doy": sky["end_doy"],
+            "true_north_deg": resolved_tn,
+            "total_kwh_m2": res["total_kwh_m2"],
+            "direct_kwh_m2": res["direct_kwh_m2"],
+            "diffuse_kwh_m2": res["diffuse_kwh_m2"],
+            "sky_view_factor": res["sky_view_factor"],
+        }
+
+    if not args.get("ifc_path"):
+        raise ValueError("Provide either 'points' or 'ifc_path'.")
+
+    ifc_file = _inside_workspace(str(args["ifc_path"]), workspace=workspace, must_exist=True)
+    out_dir = _inside_workspace(str(args["out_dir"]), workspace=workspace, must_exist=False) if args.get("out_dir") else None
+
+    from .solar_engine import compute_incident_solar_radiation, render_incident_radiation_png
+
+    rad = compute_incident_solar_radiation(
+        str(ifc_file),
+        lat_deg=None if (epw_source is not None and args.get("lat_deg") is None and args.get("city") is None) else lat_deg,
+        start_doy=start_doy,
+        end_doy=end_doy,
+        start_hour=start_hour,
+        end_hour=end_hour,
+        true_north_deg=tn,
+        epw_path_or_text=epw_source,
+        max_edge_m=float(args.get("max_edge_m", 1.5)),
+        ground_reflectance=ground_reflectance,
+        day_step=day_step,
+    )
+    out_rad: dict[str, Any] = {
+        "sky_source": rad["sky_source"],
+        "lat_deg": rad["lat_deg"],
+        "start_doy": rad["start_doy"],
+        "end_doy": rad["end_doy"],
+        "true_north_deg": rad["true_north_deg"],
+        "min_kwh_m2": rad["min_kwh_m2"],
+        "max_kwh_m2": rad["max_kwh_m2"],
+        "mean_kwh_m2": rad["mean_kwh_m2"],
+        "total_surface_area_m2": rad["total_surface_area_m2"],
+        "total_incident_kwh": rad["total_incident_kwh"],
+        "by_class": rad["by_class"],
+        "surface_count": len(rad["total_kwh_m2"]),
+        "assumptions": rad["assumptions"],
+    }
+    if out_dir is not None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        rad_png = render_incident_radiation_png(
+            rad,
+            out_dir / "solar_radiation.png",
+            title=f"Incident Solar Radiation ({rad['start_doy']}–{rad['end_doy']})",
+        )
+        heatmap_path = out_dir / "radiation_heatmap.json"
+        heatmap_path.write_text(json.dumps(rad["overlay"], indent=2), encoding="utf-8")
+        out_rad["solar_radiation_png"] = rad_png
+        out_rad["radiation_heatmap_json"] = str(heatmap_path)
+    return out_rad
+
+
 def _tool_build_studio_prompt(args: dict[str, Any], **_kw: Any) -> dict[str, Any]:
     style_key = str(args.get("style_key") or "ArchDaily Golden Hour Timber")
     camera_key = str(args.get("camera_key") or "isometric_cutaway")
@@ -563,6 +710,7 @@ _DISPATCH = {
     "solar_position_and_dial": _tool_solar_position_and_dial,
     "check_envelope_gates": _tool_check_envelope_gates,
     "solar_direct_sun_hours": _tool_solar_direct_sun_hours,
+    "solar_incident_radiation": _tool_solar_incident_radiation,
     "build_studio_prompt": _tool_build_studio_prompt,
     "check_adapter_compatibility": _tool_check_adapter_compatibility,
     "verify_script": _tool_verify_script,

@@ -1512,6 +1512,8 @@ def render_solar_photoreal_timelapse(
                 "shadow_clay_path": ctrl["shadow_clay_path"],
                 "lighting": lighting,
                 "roof_assumed": ctrl["roof_assumed"],
+                "camera_fallback": bool(ctrl.get("camera_fallback", False)),
+                "fallback_reason": ctrl.get("fallback_reason"),
             }
         )
 
