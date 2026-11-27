@@ -1,0 +1,98 @@
+{
+  "spec_version": "0.1.0",
+  "project": "mutinybim-mixer",
+  "description": "Pinned weight-space contract so every community-trained MutinyBIM trade LoRA lives in the same linear subspace and composes cleanly via Task Arithmetic, TIES, DARE, SVD steering, and CMA-ES EvoMerge.",
+  "base_model": {
+    "hf_id": "google/gemma-4-31B-it",
+    "unsloth_id": "unsloth/gemma-4-31B-it",
+    "architecture": "Gemma4ForConditionalGeneration",
+    "num_hidden_layers": 60,
+    "license": "Apache-2.0",
+    "thinking_tokens": {
+      "trigger": "<|think|>",
+      "open": "<|channel>thought\n",
+      "close": "<channel|>"
+    },
+    "generation_defaults": {
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "top_k": 64
+    }
+  },
+  "lora": {
+    "r": 16,
+    "lora_alpha": 16,
+    "lora_dropout": 0.0,
+    "bias": "none",
+    "target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj"
+    ],
+    "modality_scope": "language_model"
+  },
+  "mutinybim": {
+    "repo": "https://github.com/permitzip/mutinybim.git",
+    "commit": "efe343144c61cd8e08890b75f5f45c3541fe4abb",
+    "node_min": "22.13"
+  },
+  "trades": {
+    "architecture": {
+      "pack": "bim-pack-architecture",
+      "example": "small-office",
+      "description": "Levels, exterior/interior walls, doors, windows, traced rooms, ceilings, and plan sheets."
+    },
+    "mechanical": {
+      "pack": "bim-pack-mechanical",
+      "example": "rooftop-unit",
+      "description": "HVAC equipment, duct sizing reads, supply/return duct routing, tags, and schedules."
+    },
+    "plumbing": {
+      "pack": "bim-pack-plumbing",
+      "example": "plumbing-riser",
+      "description": "Fixtures, DFU/WSFU plumbing code calcs, sloped drains, stacks, Hunter demand, and tags."
+    },
+    "electrical": {
+      "pack": "bim-pack-electrical",
+      "example": "electrical-room",
+      "description": "Panelboards, NEC receptacle proposers, room circuit templates, load calcs, and panel schedules."
+    },
+    "drafting": {
+      "pack": "bim-script",
+      "example": "mechanical-details",
+      "description": "2D CAD drafting details, hatches, break lines, dimensions, aligned callout stacks, and QA checks."
+    },
+    "structural": {
+      "pack": "bim-pack-structural",
+      "example": null,
+      "description": "Structural grids, columns, beams, framing bays, slabs, and foundations."
+    },
+    "fire_protection": {
+      "pack": "bim-first-party",
+      "example": null,
+      "description": "Fire protection risers, sprinkler zones, coverage heads, and life-safety coordination."
+    },
+    "clash_negation": {
+      "pack": "bim-lint",
+      "example": null,
+      "description": "Failure-mode adapter trained on scripts that run cleanly but trigger bim-lint errors; applied with negative weight (-lambda)."
+    },
+    "coord_rlvr": {
+      "pack": "bim-first-party",
+      "example": null,
+      "description": "Multi-trade spatial coordination adapter trained via GRPO directly against bim-lint and bim-calc."
+    }
+  },
+  "reward_weights": {
+    "format_and_lint": 0.15,
+    "compile_and_load": 0.15,
+    "executes_cleanly": 0.25,
+    "kernel_check_ok": 0.15,
+    "bim_lint_clean": 0.20,
+    "spec_match": 0.10
+  }
+}

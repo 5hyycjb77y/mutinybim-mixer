@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+outputs/
+adapters/
+mutinybim/
+.DS_Store
+*.gguf
+*.safetensors
+.ipynb_checkpoints/

@@ -1,0 +1,20 @@
+{
+  "spec_version": "0.1.0",
+  "base_model": "google/gemma-4-31B-it",
+  "adapters": [],
+  "example_entry": {
+    "id": "example-arch-v1",
+    "trade": "architecture",
+    "hf_repo": "your-org/mutinybim-gemma4-31b-arch-v1",
+    "revision": "main",
+    "contributor": "github-handle",
+    "method": "grpo",
+    "default_weight": 0.8,
+    "scorecard": {
+      "pass_rate": 0.92,
+      "zero_clash_rate": 0.88,
+      "mean_reward": 0.91,
+      "benchmark_tasks": 12
+    }
+  }
+}

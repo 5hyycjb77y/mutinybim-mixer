@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mutinybim-mixer"
+version = "0.1.0"
+description = "Crowdsourced weight-space programming for MutinyBIM on Gemma 4 31B: train composable trade LoRAs, blend with Task Arithmetic / TIES / DARE / CMA-ES EvoMerge against bim-lint, and serve to bim-mcp."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+colab = [
+  "torch>=2.4.0",
+  "safetensors>=0.4.5",
+  "huggingface_hub>=0.25.0",
+  "cma>=3.3.0",
+  "numpy>=1.26.0",
+  "matplotlib>=3.8.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["mixer*", "verifier*"]
