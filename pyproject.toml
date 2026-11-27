@@ -11,6 +11,9 @@ license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
 dependencies = []
 
+[project.scripts]
+mutinybim-mixer-mcp = "mixer.mcp_server:main"
+
 [project.optional-dependencies]
 colab = [
   "torch>=2.4.0",

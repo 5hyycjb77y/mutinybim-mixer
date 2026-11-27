@@ -71,7 +71,10 @@ mutinybim-mixer/
 │   ├── sketch_engine.py              # Self-supervised parametric floor plans + organic napkin-sketch generator
 │   ├── solar_engine.py               # Geolocation + solstice/equinox Sun-Dial HUD + 3D Solar Dome + Direct Sun Hours
 │   ├── studio_render.py              # IFC → GLB + depth/clay + turntable GIF + 4-shot storyboard + Mixtape presets
+│   ├── mcp_server.py                 # Zero-dependency Stdio MCP server exposing mixer & verifier tools to AI agents
 │   └── mcp_bridge.py                 # Streamable HTTP MCP bridge to live `mutinybim-mcp` & `bim-editor`
+├── .mcp.json                         # One-click repo-root MCP discovery for Claude Code / Cursor / Windsurf
+├── AGENTS.md                         # Universal agent runbook (MCP tools, Colab GPU bridge, contracts & tests)
 ├── notebooks/
 │   ├── 01_train_trade_lora.ipynb     # One-click Colab trainer (SFT + RLVR GRPO)
 │   ├── 02_weight_space_mixer.ipynb   # One-click Colab weight-space mixer + SVD plots + EvoMerge + server
@@ -108,7 +111,39 @@ Open [`notebooks/01_train_trade_lora.ipynb`](notebooks/01_train_trade_lora.ipynb
 
 Run setup and verifier checks before allocating a GPU. Use synthetic inputs, keep public Gradio sharing off for the initial run, and try one generation with the default SDXL backend before FLUX or training. Only grant a scoped Hugging Face token when a selected model or an explicit adapter upload needs it. Never put tokens in a cell, printed output, or Git. The notebook’s optional public link is not a private workspace.
 
-### 4. Run Local Tests
+### 4. Connect Your AI Agent (MCP & Colab)
+This repo follows the MutinyBIM convention: open it in an MCP-capable agent and it exposes tools automatically via repo-root [`.mcp.json`](.mcp.json) and [`AGENTS.md`](AGENTS.md).
+
+1. **Mixer MCP Server (works out of the box, 0 extra deps):**
+   * **Claude Code / Cursor / Windsurf:** automatically discovers [`.mcp.json`](.mcp.json), or register manually:
+     ```bash
+     claude mcp add mutinybim-mixer -- python3 -m mixer.mcp_server
+     ```
+   * **Antigravity (`~/.gemini/config/mcp_config.json`):**
+     ```json
+     {
+       "mcpServers": {
+         "mutinybim-mixer": {
+           "command": "python3",
+           "args": ["-m", "mixer.mcp_server"]
+         }
+       }
+     }
+     ```
+   * **Google Colab GPU Bridge ([`googlecolab/colab-mcp`](https://github.com/googlecolab/colab-mcp)):** pair a live browser Colab tab so your agent can run the notebooks and GPU checks directly:
+     ```json
+     {
+       "mcpServers": {
+         "colab-mcp": {
+           "command": "uvx",
+           "args": ["git+https://github.com/googlecolab/colab-mcp"]
+         }
+       }
+     }
+     ```
+   * **Optional Live Verifier:** run `node verifier/server.mjs --mutinybim /path/to/mutinybim --port 8787` alongside `mixer.mcp_server` so `verify_script` and `export_bundle` run real MutinyBIM checks. `mixer.mcp_server` is a local tool server: file reads/writes are confined to `--workspace` / `MIXER_WORKSPACE` (default: repo root), and `--verifier-url` / `MIXER_VERIFIER_URL` is server-configured (loopback-only unless `--allow-remote-verifier` is given).
+
+### 5. Run Local Tests
 No GPU or PyTorch required for the core test suite:
 ```bash
 node --check verifier/server.mjs

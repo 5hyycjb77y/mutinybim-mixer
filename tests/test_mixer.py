@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import ast
 import json
+import subprocess
+import sys
+import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,6 +20,7 @@ from mixer.lora_ops import (
     load_spec,
     parse_lora_key,
 )
+from mixer.mcp_server import TOOLS, _validate_verifier_url, handle_jsonrpc_message
 from mixer.prompts import MULTI_TRADE_BENCHMARK, TRADE_TASKS, format_task_prompt
 from mixer.sketch_engine import (
     SKETCH_STYLES,
@@ -868,6 +872,266 @@ class TestSketchEngine(unittest.TestCase):
             self.assertTrue(svg.endswith("</svg>"))
             self.assertIn("<path", svg)
             self.assertIn("CAFE SEATING", svg)
+
+
+class TestMixerMcpServer(unittest.TestCase):
+    def test_mcp_json_and_agents_md_present(self) -> None:
+        mcp_cfg = json.loads((REPO_ROOT / ".mcp.json").read_text(encoding="utf-8"))
+        self.assertIn("mutinybim-mixer", mcp_cfg.get("mcpServers", {}))
+        srv = mcp_cfg["mcpServers"]["mutinybim-mixer"]
+        self.assertEqual(srv["command"], "python3")
+        self.assertEqual(srv["args"], ["-m", "mixer.mcp_server"])
+
+        agents_md = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        self.assertIn("mixer.mcp_server", agents_md)
+        self.assertIn("googlecolab/colab-mcp", agents_md)
+
+    def test_jsonrpc_tools_list_and_offline_calls(self) -> None:
+        init = handle_jsonrpc_message({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05"}})
+        self.assertEqual(init["result"]["serverInfo"]["name"], "mutinybim-mixer")
+        self.assertIsNone(handle_jsonrpc_message({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+        self.assertEqual(handle_jsonrpc_message({"jsonrpc": "2.0", "id": 2, "method": "ping"})["result"], {})
+
+        tlist = handle_jsonrpc_message({"jsonrpc": "2.0", "id": 3, "method": "tools/list"})
+        names = [t["name"] for t in tlist["result"]["tools"]]
+        self.assertEqual(names, [t["name"] for t in TOOLS])
+        self.assertEqual(len(names), 9)
+
+        def _call(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            resp = handle_jsonrpc_message(
+                {"jsonrpc": "2.0", "id": 10, "method": "tools/call", "params": {"name": tool_name, "arguments": arguments}}
+            )
+            self.assertFalse(resp["result"]["isError"], resp)
+            return json.loads(resp["result"]["content"][0]["text"])
+
+        info = _call("mixer_info", {})
+        self.assertEqual(info["mutinybim"]["commit"], "fbf5f61424b64d9f99b1c896ca02328c88d9813c")
+        self.assertIn("passive_solar", info["trades"])
+
+        sk = _call("generate_sketch", {"topology": "boutique_cafe", "seed": 77, "style": "black_sharpie_napkin"})
+        self.assertEqual(sk["topology"], "boutique_cafe")
+        self.assertTrue(sk["svg"].startswith("<svg"))
+
+        sol = _call("solar_position_and_dial", {"city": "sydney", "date": "summer_solstice", "hour_solar": 12.0})
+        self.assertTrue(sol["azimuth_deg"] < 2.0 or sol["azimuth_deg"] > 358.0)
+        self.assertIn("<svg", sol["svg"])
+
+        gates = _call(
+            "check_envelope_gates",
+            {
+                "model": {
+                    "walls": [
+                        {"id": "wS", "start": [0, 0], "end": [10, 0], "height_m": 3.0},
+                        {"id": "wE", "start": [10, 0], "end": [10, 8], "height_m": 3.0},
+                        {"id": "wN", "start": [10, 8], "end": [0, 8], "height_m": 3.0},
+                        {"id": "wW", "start": [0, 8], "end": [0, 0], "height_m": 3.0},
+                    ],
+                    "windows": [{"id": "win1", "host_wall_id": "wS", "width_m": 4.0, "height_m": 1.5}],
+                    "roofs": [{"id": "r1"}],
+                },
+                "winter_mean_hours": 4.5,
+                "summer_mean_hours": 4.0,
+                "verify_ok": True,
+                "spec_match": 1.0,
+            },
+        )
+        self.assertTrue(gates["has_closed_envelope"])
+        self.assertAlmostEqual(gates["facade_wwr"]["S"], 0.2, places=3)
+        self.assertGreater(gates["passive_solar_reward"], 0.8)
+
+        sun_pts = _call("solar_direct_sun_hours", {"points": [[0.0, 0.0, 0.0]], "city": "san_francisco", "date": "spring_equinox", "step_minutes": 30})
+        self.assertGreater(sun_pts["point_hours"][0], 11.0)
+
+        pr = _call("build_studio_prompt", {"user_vibe": "Warm cedar library"})
+        self.assertIn("Warm cedar library", pr["positive_prompt"])
+
+        compat = _call("check_adapter_compatibility", {"adapters": [{"r": 16, "lora_alpha": 16, "lora_dropout": 0.0, "bias": "none"}]})
+        self.assertTrue(compat["all_compatible"])
+
+        unk = handle_jsonrpc_message({"jsonrpc": "2.0", "id": 99, "method": "tools/call", "params": {"name": "no_such_tool"}})
+        self.assertIn("error", unk)
+
+    def test_stdio_subprocess_roundtrip(self) -> None:
+        msgs = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05"}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "mixer_info", "arguments": {}}},
+        ]
+        stdin_payload = "\n".join(json.dumps(m) for m in msgs) + "\n"
+        proc = subprocess.run(
+            [sys.executable, "-m", "mixer.mcp_server"],
+            cwd=str(REPO_ROOT),
+            input=stdin_payload,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        lines = [json.loads(line) for line in proc.stdout.strip().splitlines() if line.strip()]
+        self.assertEqual([ln["id"] for ln in lines], [1, 2, 3])
+        self.assertEqual(len(lines[1]["result"]["tools"]), 9)
+        info = json.loads(lines[2]["result"]["content"][0]["text"])
+        self.assertEqual(info["spec_version"], "0.1.0")
+
+    def test_workspace_confinement_blocks_outside_and_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as ws_tmp, tempfile.TemporaryDirectory() as out_tmp:
+            ws = Path(ws_tmp).resolve()
+            outside = Path(out_tmp).resolve()
+            outside_cfg = outside / "adapter_config.json"
+            outside_cfg.write_text(json.dumps({"r": 16, "lora_alpha": 16}), encoding="utf-8")
+            outside_ifc = outside / "canary.ifc"
+            outside_ifc.write_text("ISO-10303-21;\nDATA;\nENDSEC;\n", encoding="utf-8")
+            outside_write = outside / "written-here"
+
+            # Outside reads must return isError=True.
+            r1 = handle_jsonrpc_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": "check_adapter_compatibility", "arguments": {"adapters": [str(outside_cfg)]}},
+                },
+                workspace=ws,
+            )
+            self.assertTrue(r1["result"]["isError"])
+
+            r2 = handle_jsonrpc_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": "check_envelope_gates", "arguments": {"ifc_path": str(outside_ifc)}},
+                },
+                workspace=ws,
+            )
+            self.assertTrue(r2["result"]["isError"])
+
+            # Outside writes must fail without creating directories.
+            r3 = handle_jsonrpc_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "export_bundle",
+                        "arguments": {"ts_source": "export default 1;", "out_dir": str(outside_write)},
+                    },
+                },
+                workspace=ws,
+            )
+            self.assertTrue(r3["result"]["isError"])
+            self.assertFalse(outside_write.exists())
+
+            r4 = handle_jsonrpc_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "solar_direct_sun_hours",
+                        "arguments": {"ifc_path": "inside.ifc", "out_dir": str(outside_write)},
+                    },
+                },
+                workspace=ws,
+            )
+            self.assertTrue(r4["result"]["isError"])
+            self.assertFalse(outside_write.exists())
+
+            # Symlinks inside workspace pointing outside must also be refused.
+            (ws / "link_cfg.json").symlink_to(outside_cfg)
+            r5 = handle_jsonrpc_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "tools/call",
+                    "params": {"name": "check_adapter_compatibility", "arguments": {"adapters": ["link_cfg.json"]}},
+                },
+                workspace=ws,
+            )
+            self.assertTrue(r5["result"]["isError"])
+
+            # Valid relative path inside workspace succeeds.
+            (ws / "ok_cfg.json").write_text(json.dumps({"r": 16, "lora_alpha": 16, "bias": "none"}), encoding="utf-8")
+            r6 = handle_jsonrpc_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 6,
+                    "method": "tools/call",
+                    "params": {"name": "check_adapter_compatibility", "arguments": {"adapters": ["ok_cfg.json"]}},
+                },
+                workspace=ws,
+            )
+            self.assertFalse(r6["result"]["isError"])
+            self.assertTrue(json.loads(r6["result"]["content"][0]["text"])["all_compatible"])
+
+    def test_verifier_url_cannot_be_overridden_by_caller_and_loopback_enforced(self) -> None:
+        by_name = {t["name"]: t for t in TOOLS}
+        self.assertNotIn("verifier_url", by_name["verify_script"]["inputSchema"]["properties"])
+        self.assertNotIn("verifier_url", by_name["export_bundle"]["inputSchema"]["properties"])
+
+        self.assertEqual(_validate_verifier_url("http://127.0.0.1:8787"), "http://127.0.0.1:8787")
+        self.assertEqual(_validate_verifier_url("http://localhost:8787"), "http://localhost:8787")
+        with self.assertRaises(ValueError):
+            _validate_verifier_url("http://example.com:8787")
+        self.assertEqual(
+            _validate_verifier_url("http://example.com:8787", allow_remote=True),
+            "http://example.com:8787",
+        )
+
+        hits: list[str] = []
+
+        class _CanaryHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                hits.append(f"GET {self.path}")
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), _CanaryHandler)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            canary_url = f"http://127.0.0.1:{srv.server_address[1]}"
+            # Configure server with a closed loopback port (not canary_url) and ensure caller's verifier_url is ignored.
+            with tempfile.TemporaryDirectory() as unused_tmp:
+                resp = handle_jsonrpc_message(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "verify_script",
+                            "arguments": {"ts_source": "export default 1;", "verifier_url": canary_url},
+                        },
+                    },
+                    verifier_url="http://127.0.0.1:9",
+                    workspace=Path(unused_tmp),
+                )
+            self.assertTrue(resp["result"]["isError"])
+            self.assertEqual(hits, [])
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_stdio_malformed_json_recovers_for_next_ping(self) -> None:
+        stdin_payload = "not-valid-json\n" + json.dumps({"jsonrpc": "2.0", "id": 7, "method": "ping"}) + "\n"
+        proc = subprocess.run(
+            [sys.executable, "-m", "mixer.mcp_server"],
+            cwd=str(REPO_ROOT),
+            input=stdin_payload,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        lines = [json.loads(line) for line in proc.stdout.strip().splitlines() if line.strip()]
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(lines[0]["error"]["code"], -32700)
+        self.assertEqual(lines[1], {"jsonrpc": "2.0", "id": 7, "result": {}})
 
 
 if __name__ == "__main__":

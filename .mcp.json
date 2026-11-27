@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "mutinybim-mixer": {
+      "command": "python3",
+      "args": ["-m", "mixer.mcp_server"]
+    }
+  }
+}
