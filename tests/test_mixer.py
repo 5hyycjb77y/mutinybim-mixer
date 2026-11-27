@@ -605,6 +605,107 @@ class TestStudioRender(unittest.TestCase):
         self.assertTrue(empty_pose["camera_fallback"])
         self.assertEqual(empty_pose["fallback_reason"], "no_rooms_detected")
 
+    def test_sdxl_loads_fp16_weights_and_stays_on_gpu_when_it_fits(self) -> None:
+        """Free Colab has ~12.7 GB of RAM: CPU offload plus the fp32 ControlNet file crashed the runtime."""
+        import types
+        from unittest import mock
+
+        from mixer import studio_render as sr
+
+        t4_vram = 15_835_398_144  # what a Colab T4 reports
+        self.assertEqual(sr._sdxl_placement(True, t4_vram), "cuda")
+        self.assertEqual(sr._sdxl_placement(True, 8 * 1024 ** 3), "cpu_offload")
+        self.assertEqual(sr._sdxl_placement(False, 80 * 1024 ** 3), "cpu_offload")
+
+        def run(vram: int, shadow: bool) -> list[tuple[Any, ...]]:
+            calls: list[tuple[Any, ...]] = []
+
+            class FakeImage:
+                size = (64, 48)
+
+                def convert(self, _mode: str) -> "FakeImage":
+                    return self
+
+                def save(self, path: Any) -> None:
+                    Path(path).write_bytes(b"png")
+
+            class FakePipe:
+                def __init__(self, kind: str) -> None:
+                    self.kind = kind
+
+                def to(self, device: str) -> "FakePipe":
+                    calls.append((self.kind, "to", device))
+                    return self
+
+                def enable_model_cpu_offload(self) -> None:
+                    calls.append((self.kind, "cpu_offload"))
+
+                def enable_vae_tiling(self) -> None:
+                    calls.append((self.kind, "vae_tiling"))
+
+                def __call__(self, **kwargs: Any) -> Any:
+                    calls.append((self.kind, "call", tuple(sorted(kwargs))))
+                    return types.SimpleNamespace(images=[FakeImage()])
+
+            class FakeControlNet(FakePipe):
+                @classmethod
+                def from_pretrained(cls, repo: str, **kwargs: Any) -> "FakeControlNet":
+                    calls.append(("controlnet", "load", repo, kwargs.get("variant"), kwargs.get("use_safetensors")))
+                    return cls("controlnet")
+
+            class FakeSDXL(FakePipe):
+                @classmethod
+                def from_pretrained(cls, repo: str, **kwargs: Any) -> "FakeSDXL":
+                    calls.append(("sdxl", "load", repo, kwargs.get("variant"), kwargs.get("use_safetensors")))
+                    return cls("sdxl")
+
+            class FakeImg2Img(FakePipe):
+                @classmethod
+                def from_pipe(cls, _pipe: Any) -> "FakeImg2Img":
+                    calls.append(("img2img", "from_pipe"))
+                    return cls("img2img")
+
+            fake_torch = types.ModuleType("torch")
+            fake_torch.float16 = "float16"
+            fake_torch.cuda = types.SimpleNamespace(
+                is_available=lambda: True,
+                empty_cache=lambda: None,
+                get_device_properties=lambda _i: types.SimpleNamespace(total_memory=vram),
+            )
+            fake_torch.Generator = lambda device=None: types.SimpleNamespace(manual_seed=lambda _s: "generator")
+            fake_diffusers = types.ModuleType("diffusers")
+            fake_diffusers.ControlNetModel = FakeControlNet
+            fake_diffusers.StableDiffusionXLControlNetPipeline = FakeSDXL
+            fake_diffusers.StableDiffusionXLControlNetImg2ImgPipeline = FakeImg2Img
+            fake_pil = types.ModuleType("PIL")
+            fake_pil.Image = types.SimpleNamespace(open=lambda _p: FakeImage(), Resampling=types.SimpleNamespace(LANCZOS=1))
+
+            with tempfile.TemporaryDirectory() as td, mock.patch.dict(
+                sys.modules, {"torch": fake_torch, "diffusers": fake_diffusers, "PIL": fake_pil, "PIL.Image": fake_pil.Image}
+            ), mock.patch.dict(sr._PIPELINE_CACHE, {}, clear=True):
+                out = sr.render_photoreal(
+                    Path(td) / "depth.png", "vibe", "ArchDaily Golden Hour Timber", "opposite_interior",
+                    Path(td) / "render.png", steps=2, shadow_init_path=(Path(td) / "clay.png") if shadow else None,
+                )
+                self.assertTrue(Path(out).exists())
+            return calls
+
+        on_t4 = run(t4_vram, shadow=True)
+        self.assertIn(("controlnet", "load", "diffusers/controlnet-depth-sdxl-1.0", "fp16", True), on_t4)
+        self.assertIn(("sdxl", "load", "stabilityai/stable-diffusion-xl-base-1.0", "fp16", True), on_t4)
+        self.assertIn(("controlnet", "to", "cuda"), on_t4)
+        self.assertIn(("sdxl", "to", "cuda"), on_t4)
+        self.assertNotIn(("sdxl", "cpu_offload"), on_t4)
+        # The ControlNet moves to the GPU before SDXL loads, so both never sit in system RAM together.
+        self.assertLess(on_t4.index(("controlnet", "to", "cuda")), [c[:2] for c in on_t4].index(("sdxl", "load")))
+        self.assertIn(("img2img", "from_pipe"), on_t4)
+        self.assertTrue(any(c[:2] == ("img2img", "call") and "control_image" in c[2] for c in on_t4))
+
+        small_gpu = run(8 * 1024 ** 3, shadow=False)
+        self.assertIn(("sdxl", "cpu_offload"), small_gpu)
+        self.assertNotIn(("sdxl", "to", "cuda"), small_gpu)
+        self.assertNotIn(("img2img", "from_pipe"), small_gpu)
+
 
 class TestSolarEngine(unittest.TestCase):
     def test_solar_position_hemispheres_and_equinox(self) -> None:

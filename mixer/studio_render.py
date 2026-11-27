@@ -1300,6 +1300,17 @@ def render_storyboard_4up(
 _PIPELINE_CACHE: dict[str, Any] = {}
 
 
+def _sdxl_placement(cuda_available: bool, vram_bytes: int, *, min_vram_gib: float = 14.0) -> str:
+    """Return ``"cuda"`` to keep the fp16 SDXL + ControlNet pipeline on the GPU, else ``"cpu_offload"``.
+
+    CPU offload parks every idle component in system RAM. On a free Colab T4 (about 12.7 GB of RAM)
+    that ran the runtime out of memory, while the fp16 pipeline (~10 GB) fits a T4's ~15 GiB of VRAM.
+    """
+    if cuda_available and int(vram_bytes) >= float(min_vram_gib) * (1024 ** 3):
+        return "cuda"
+    return "cpu_offload"
+
+
 def render_photoreal(
     control_image_path: str | Path,
     user_vibe: str,
@@ -1354,30 +1365,43 @@ def render_photoreal(
             generator=gen,
         ).images[0]
     else:
-        from diffusers import (  # type: ignore
-            ControlNetModel,
-            StableDiffusionXLControlNetImg2ImgPipeline,
-            StableDiffusionXLControlNetPipeline,
-        )
+        from diffusers import ControlNetModel, StableDiffusionXLControlNetPipeline  # type: ignore
 
         pipe = _PIPELINE_CACHE.get("sdxl_depth")
         if pipe is None:
+            vram = torch.cuda.get_device_properties(0).total_memory if torch.cuda.is_available() else 0
+            placement = _sdxl_placement(torch.cuda.is_available(), vram)
+            # fp16 weight files only: the full-precision ControlNet is a 5 GB download that is cast after loading.
             controlnet = ControlNetModel.from_pretrained(
                 "diffusers/controlnet-depth-sdxl-1.0",
                 torch_dtype=torch.float16,
+                variant="fp16",
+                use_safetensors=True,
             )
+            if placement == "cuda":
+                controlnet = controlnet.to("cuda")  # free its system RAM before SDXL itself loads
             pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
                 "stabilityai/stable-diffusion-xl-base-1.0",
                 controlnet=controlnet,
                 torch_dtype=torch.float16,
                 variant="fp16",
+                use_safetensors=True,
             )
-            pipe.enable_model_cpu_offload()
+            if placement == "cuda":
+                pipe = pipe.to("cuda")
+            else:
+                pipe.enable_model_cpu_offload()
+            try:
+                pipe.enable_vae_tiling()  # keeps the 1024 px VAE decode inside a 16 GB card
+            except Exception:
+                pass
             _PIPELINE_CACHE["sdxl_depth"] = pipe
 
         if shadow_init_path is not None:
             img2img_pipe = _PIPELINE_CACHE.get("sdxl_depth_img2img")
             if img2img_pipe is None:
+                from diffusers import StableDiffusionXLControlNetImg2ImgPipeline  # type: ignore
+
                 img2img_pipe = StableDiffusionXLControlNetImg2ImgPipeline.from_pipe(pipe)
                 _PIPELINE_CACHE["sdxl_depth_img2img"] = img2img_pipe
             init_img = Image.open(shadow_init_path).convert("RGB")
