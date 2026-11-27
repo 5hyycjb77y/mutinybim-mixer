@@ -1402,7 +1402,9 @@ def render_photoreal(
             if img2img_pipe is None:
                 from diffusers import StableDiffusionXLControlNetImg2ImgPipeline  # type: ignore
 
-                img2img_pipe = StableDiffusionXLControlNetImg2ImgPipeline.from_pipe(pipe)
+                img2img_pipe = StableDiffusionXLControlNetImg2ImgPipeline.from_pipe(
+                    pipe, torch_dtype=torch.float16
+                )
                 _PIPELINE_CACHE["sdxl_depth_img2img"] = img2img_pipe
             init_img = Image.open(shadow_init_path).convert("RGB")
             if init_img.size != control_img.size:

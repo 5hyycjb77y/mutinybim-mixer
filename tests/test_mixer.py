@@ -661,8 +661,8 @@ class TestStudioRender(unittest.TestCase):
 
             class FakeImg2Img(FakePipe):
                 @classmethod
-                def from_pipe(cls, _pipe: Any) -> "FakeImg2Img":
-                    calls.append(("img2img", "from_pipe"))
+                def from_pipe(cls, _pipe: Any, **kwargs: Any) -> "FakeImg2Img":
+                    calls.append(("img2img", "from_pipe", kwargs.get("torch_dtype")))
                     return cls("img2img")
 
             fake_torch = types.ModuleType("torch")
@@ -698,13 +698,95 @@ class TestStudioRender(unittest.TestCase):
         self.assertNotIn(("sdxl", "cpu_offload"), on_t4)
         # The ControlNet moves to the GPU before SDXL loads, so both never sit in system RAM together.
         self.assertLess(on_t4.index(("controlnet", "to", "cuda")), [c[:2] for c in on_t4].index(("sdxl", "load")))
-        self.assertIn(("img2img", "from_pipe"), on_t4)
+        self.assertIn(("img2img", "from_pipe", "float16"), on_t4)
+        self.assertTrue(any(c[:2] == ("img2img", "from_pipe") and c[2] == "float16" for c in on_t4))
         self.assertTrue(any(c[:2] == ("img2img", "call") and "control_image" in c[2] for c in on_t4))
 
         small_gpu = run(8 * 1024 ** 3, shadow=False)
         self.assertIn(("sdxl", "cpu_offload"), small_gpu)
         self.assertNotIn(("sdxl", "to", "cuda"), small_gpu)
-        self.assertNotIn(("img2img", "from_pipe"), small_gpu)
+        self.assertFalse(any(c[:2] == ("img2img", "from_pipe") for c in small_gpu))
+
+    def test_sdxl_img2img_from_pipe_passes_fp16_dtype(self) -> None:
+        """Upstream diffusers from_pipe defaults to float32 unless torch_dtype=torch.float16 is passed."""
+        import types
+        from unittest import mock
+
+        from mixer import studio_render as sr
+
+        from_pipe_calls: list[dict[str, Any]] = []
+
+        class FakeImage:
+            size = (64, 48)
+
+            def convert(self, _mode: str) -> "FakeImage":
+                return self
+
+            def save(self, path: Any) -> None:
+                Path(path).write_bytes(b"png")
+
+        class FakePipe:
+            def to(self, _device: str) -> "FakePipe":
+                return self
+
+            def enable_model_cpu_offload(self) -> None:
+                pass
+
+            def enable_vae_tiling(self) -> None:
+                pass
+
+            def __call__(self, **_kwargs: Any) -> Any:
+                return types.SimpleNamespace(images=[FakeImage()])
+
+        class FakeControlNet(FakePipe):
+            @classmethod
+            def from_pretrained(cls, _repo: str, **_kwargs: Any) -> "FakeControlNet":
+                return cls()
+
+        class FakeSDXL(FakePipe):
+            @classmethod
+            def from_pretrained(cls, _repo: str, **_kwargs: Any) -> "FakeSDXL":
+                return cls()
+
+        class FakeImg2Img(FakePipe):
+            @classmethod
+            def from_pipe(cls, _pipe: Any, **kwargs: Any) -> "FakeImg2Img":
+                # Simulate upstream diffusers defaulting to float32 when torch_dtype is omitted.
+                dtype = kwargs.get("torch_dtype", "float32")
+                from_pipe_calls.append({"dtype": dtype, "kwargs": dict(kwargs)})
+                return cls()
+
+        fake_torch = types.ModuleType("torch")
+        fake_torch.float16 = "float16"
+        fake_torch.float32 = "float32"
+        fake_torch.cuda = types.SimpleNamespace(
+            is_available=lambda: True,
+            empty_cache=lambda: None,
+            get_device_properties=lambda _i: types.SimpleNamespace(total_memory=15_835_398_144),
+        )
+        fake_torch.Generator = lambda device=None: types.SimpleNamespace(manual_seed=lambda _s: "generator")
+        fake_diffusers = types.ModuleType("diffusers")
+        fake_diffusers.ControlNetModel = FakeControlNet
+        fake_diffusers.StableDiffusionXLControlNetPipeline = FakeSDXL
+        fake_diffusers.StableDiffusionXLControlNetImg2ImgPipeline = FakeImg2Img
+        fake_pil = types.ModuleType("PIL")
+        fake_pil.Image = types.SimpleNamespace(open=lambda _p: FakeImage(), Resampling=types.SimpleNamespace(LANCZOS=1))
+
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(
+            sys.modules, {"torch": fake_torch, "diffusers": fake_diffusers, "PIL": fake_pil, "PIL.Image": fake_pil.Image}
+        ), mock.patch.dict(sr._PIPELINE_CACHE, {}, clear=True):
+            sr.render_photoreal(
+                Path(td) / "depth.png", "vibe", "ArchDaily Golden Hour Timber", "opposite_interior",
+                Path(td) / "cold.png", steps=2, shadow_init_path=Path(td) / "clay.png",
+            )
+            sr.render_photoreal(
+                Path(td) / "depth.png", "vibe", "ArchDaily Golden Hour Timber", "opposite_interior",
+                Path(td) / "warm.png", steps=2, shadow_init_path=Path(td) / "clay.png",
+            )
+
+        self.assertEqual(len(from_pipe_calls), 1)
+        self.assertEqual(from_pipe_calls[0]["dtype"], fake_torch.float16)
+        self.assertIn("torch_dtype", from_pipe_calls[0]["kwargs"])
 
 
 class TestSolarEngine(unittest.TestCase):
