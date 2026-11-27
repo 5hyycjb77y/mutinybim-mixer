@@ -184,6 +184,8 @@ class MutinyVerifierClient:
         project_name: str = "Vibe Architect Studio",
         start: str = "empty",
         params: dict[str, Any] | None = None,
+        expected_kinds: dict[str, int] | None = None,
+        min_elements: int | None = None,
         include_ifc: bool = True,
         include_svg: bool = True,
         include_pdf: bool = True,
@@ -198,6 +200,10 @@ class MutinyVerifierClient:
         }
         if params is not None:
             payload["params"] = params
+        if expected_kinds is not None:
+            payload["expected_kinds"] = expected_kinds
+        if min_elements is not None:
+            payload["min_elements"] = min_elements
         return ExportBundle.from_dict(self._request("POST", "/export", payload))
 
 

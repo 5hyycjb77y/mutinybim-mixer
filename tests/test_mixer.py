@@ -18,11 +18,34 @@ from mixer.lora_ops import (
     parse_lora_key,
 )
 from mixer.prompts import MULTI_TRADE_BENCHMARK, TRADE_TASKS, format_task_prompt
+from mixer.sketch_engine import (
+    SKETCH_STYLES,
+    SKETCH_TOPOLOGIES,
+    generate_sketch_dataset_specs,
+    generate_sketch_sample,
+    render_parametric_sketch_svg,
+)
+from mixer.solar_engine import (
+    CITY_PRESETS,
+    KEY_DATES,
+    build_scalar_heatmap_overlay,
+    compute_direct_sun_hours_for_points,
+    compute_passive_solar_reward,
+    envelope_gates,
+    read_ifc_true_north_deg,
+    render_sun_dial_svg,
+    solar_day_arc,
+    solar_position,
+)
 from mixer.studio_render import (
     ART_DIRECTION_PRESETS,
     CAMERA_PRESETS,
+    MIXTAPE_PRESETS,
     VIBE_INSPIRATION_CHIPS,
+    _clip_near,
+    _rasterize_camera_views,
     build_render_prompt,
+    compute_camera_pose,
 )
 from verifier.verify_client import (
     ExportBundle,
@@ -53,6 +76,8 @@ class TestConfigs(unittest.TestCase):
             "fire_protection",
             "clash_negation",
             "coord_rlvr",
+            "vision_floorplan",
+            "passive_solar",
         ):
             self.assertIn(trade, spec["trades"])
 
@@ -345,6 +370,7 @@ class TestPromptsAndNotebooks(unittest.TestCase):
             "01_train_trade_lora.ipynb",
             "02_weight_space_mixer.ipynb",
             "03_vibe_architect_studio.ipynb",
+            "04_sketch_to_bim_lora.ipynb",
         ):
             nb_path = REPO_ROOT / "notebooks" / nb_name
             nb = json.loads(nb_path.read_text(encoding="utf-8"))
@@ -366,16 +392,427 @@ class TestPromptsAndNotebooks(unittest.TestCase):
 class TestStudioRender(unittest.TestCase):
     def test_presets_and_prompt_builder(self) -> None:
         self.assertGreaterEqual(len(ART_DIRECTION_PRESETS), 5)
+        self.assertEqual(len(CAMERA_PRESETS), 4)
         self.assertIn("isometric_cutaway", CAMERA_PRESETS)
+        self.assertIn("opposite_interior", CAMERA_PRESETS)
+        self.assertGreaterEqual(len(MIXTAPE_PRESETS), 3)
+        for preset in MIXTAPE_PRESETS.values():
+            self.assertIn(preset["mode"], ("style_trio", "weight_sweep"))
+            self.assertEqual(len(preset["tracks"]), 3)
         self.assertEqual(len(VIBE_INSPIRATION_CHIPS), 4)
-        pos, neg = build_render_prompt(
-            "Cozy timber tea bar",
-            "ArchDaily Golden Hour Timber",
-            "isometric_cutaway",
+        for cam_key in CAMERA_PRESETS:
+            pos, neg = build_render_prompt(
+                "Cozy timber tea bar",
+                "ArchDaily Golden Hour Timber",
+                cam_key,
+            )
+            self.assertIn("Cozy timber tea bar", pos)
+            self.assertTrue(len(neg) > 10)
+
+    def test_clip_near_sutherland_hodgman(self) -> None:
+        # All behind -> empty
+        self.assertEqual(_clip_near([(0.0, 0.0, -1.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.04)], near=0.05), [])
+        # All in front -> unchanged 3 vertices
+        front = [(0.0, 0.0, 0.1), (1.0, 0.0, 0.2), (0.0, 1.0, 0.3)]
+        self.assertEqual(len(_clip_near(front, near=0.05)), 3)
+        # 2 vertices behind, 1 in front -> clipped triangle (3 vertices at z >= 0.05)
+        one_in = _clip_near([(0.0, 0.0, 1.05), (2.0, 0.0, -0.95), (0.0, 2.0, -0.95)], near=0.05)
+        self.assertEqual(len(one_in), 3)
+        self.assertTrue(all(p[2] >= 0.05 - 1e-9 for p in one_in))
+        self.assertAlmostEqual(one_in[1][0], 1.0, places=5)
+        # 1 vertex behind, 2 in front -> clipped quad (4 vertices at z >= 0.05)
+        two_in = _clip_near([(0.0, 0.0, -0.95), (2.0, 0.0, 1.05), (0.0, 2.0, 1.05)], near=0.05)
+        self.assertEqual(len(two_in), 4)
+        self.assertTrue(all(p[2] >= 0.05 - 1e-9 for p in two_in))
+
+    def test_camera_pose_eye_level_and_constant_turntable_scale(self) -> None:
+        vmin = (-6.0, -4.0, 0.0)
+        vmax = (6.0, 4.0, 6.4)
+        for cam_key in ("eye_level_interior", "opposite_interior"):
+            pose_gnd = compute_camera_pose(vmin, vmax, cam_key, storey_elevations_m=[0.0, 3.2], storey_index=0)
+            self.assertAlmostEqual(pose_gnd["eye"][2], 1.6, places=4)
+            self.assertAlmostEqual(pose_gnd["target"][2], 1.6, places=4)
+            pose_upper = compute_camera_pose(vmin, vmax, cam_key, storey_elevations_m=[0.0, 3.2], storey_index=1)
+            self.assertAlmostEqual(pose_upper["eye"][2], 4.8, places=4)
+
+        scales = [
+            compute_camera_pose(
+                vmin,
+                vmax,
+                "isometric_cutaway",
+                width=512,
+                height=384,
+                azimuth_override=i * 20.0,
+                elevation_override=34.0,
+            )["px_scale"]
+            for i in range(18)
+        ]
+        self.assertAlmostEqual(min(scales), max(scales), places=9)
+
+    def test_closed_box_interior_no_holes(self) -> None:
+        try:
+            import numpy as np  # type: ignore
+            import trimesh  # type: ignore
+        except ImportError:
+            self.skipTest("numpy/trimesh required for full rasterizer room test")
+
+        # Build a sealed 10m x 8m x 3m room from 6 box slabs (walls, floor, ceiling).
+        panels = [
+            trimesh.creation.box(extents=[10.2, 8.2, 0.2], transform=trimesh.transformations.translation_matrix([0, 0, -0.1])),
+            trimesh.creation.box(extents=[10.2, 8.2, 0.2], transform=trimesh.transformations.translation_matrix([0, 0, 3.1])),
+            trimesh.creation.box(extents=[10.2, 0.2, 3.0], transform=trimesh.transformations.translation_matrix([0, -4.1, 1.5])),
+            trimesh.creation.box(extents=[10.2, 0.2, 3.0], transform=trimesh.transformations.translation_matrix([0, 4.1, 1.5])),
+            trimesh.creation.box(extents=[0.2, 8.0, 3.0], transform=trimesh.transformations.translation_matrix([-5.1, 0, 1.5])),
+            trimesh.creation.box(extents=[0.2, 8.0, 3.0], transform=trimesh.transformations.translation_matrix([5.1, 0, 1.5])),
+        ]
+        meshes = [(m, (220, 220, 220, 255)) for m in panels]
+        for cam_key in ("eye_level_interior", "opposite_interior"):
+            depth_pil, _ = _rasterize_camera_views(
+                meshes,
+                camera_preset=cam_key,
+                width=160,
+                height=120,
+                storey_elevations_m=[0.0],
+            )
+            arr = np.asarray(depth_pil)
+            self.assertEqual(int(np.sum(arr == 0)), 0, f"Background hole found in {cam_key}")
+
+
+class TestSolarEngine(unittest.TestCase):
+    def test_solar_position_hemispheres_and_equinox(self) -> None:
+        self.assertGreaterEqual(len(CITY_PRESETS), 8)
+        self.assertEqual(len(KEY_DATES), 4)
+        sf_summer = solar_position(37.7749, 172, 12.0)
+        sf_winter = solar_position(37.7749, 355, 12.0)
+        self.assertGreater(sf_summer.altitude_deg, sf_winter.altitude_deg + 40.0)
+        self.assertAlmostEqual(sf_summer.azimuth_deg, 180.0, delta=1.5)
+
+        sydney_noon = solar_position(-33.8688, 172, 12.0)
+        self.assertTrue(sydney_noon.azimuth_deg < 2.0 or sydney_noon.azimuth_deg > 358.0)
+        mag = sum(c * c for c in sf_summer.sun_vec) ** 0.5
+        self.assertAlmostEqual(mag, 1.0, places=6)
+
+        _, sunrise_eq, sunset_eq = solar_day_arc(37.7749, 80, step_minutes=30)
+        self.assertAlmostEqual(sunrise_eq, 6.0, delta=0.25)
+        self.assertAlmostEqual(sunset_eq, 18.0, delta=0.25)
+
+    def test_sun_dial_svg_and_heatmap_schema(self) -> None:
+        svg = render_sun_dial_svg(
+            37.7749,
+            80,
+            15.0,
+            city_label="San Francisco",
+            date_label="Spring Equinox",
         )
-        self.assertIn("Cozy timber tea bar", pos)
-        self.assertIn("isometric", pos)
-        self.assertTrue(len(neg) > 10)
+        self.assertTrue(svg.startswith("<svg"))
+        self.assertTrue(svg.endswith("</svg>"))
+        self.assertIn("1 m pole shadow:", svg)
+        self.assertIn("Sunrise", svg)
+
+        overlay = build_scalar_heatmap_overlay(
+            [{"xMm": 0, "yMm": 0, "zMm": 850, "widthMm": 1000, "depthMm": 1000, "value": 6.5}]
+        )
+        self.assertEqual(overlay["palette"], "thermal")
+        self.assertEqual(overlay["cells"][0]["zMm"], 850)
+        self.assertGreater(
+            compute_passive_solar_reward(
+                4.5, 5.0, verify_ok=True, spec_match=1.0, has_closed_envelope=True, max_facade_wwr=0.30
+            ),
+            compute_passive_solar_reward(
+                1.0, 9.0, verify_ok=True, spec_match=1.0, has_closed_envelope=True, max_facade_wwr=0.30
+            ),
+        )
+
+    def test_polar_day_night_and_horizon_shadows(self) -> None:
+        # Svalbard (78.22°N): Jun 21 polar day, Dec 21 polar night -> no math domain errors.
+        pos_day, sr_day, ss_day = solar_day_arc(78.22, 172, step_minutes=60)
+        self.assertEqual(sr_day, 0.0)
+        self.assertEqual(ss_day, 24.0)
+        self.assertGreater(len(pos_day), 20)
+
+        pos_night, sr_night, ss_night = solar_day_arc(78.22, 355, step_minutes=60)
+        self.assertEqual(sr_night, ss_night)
+        self.assertEqual(pos_night, [])
+
+        # Horizon / night returns None instead of negative or huge shadow lengths.
+        midnight = solar_position(37.7749, 80, 0.0)
+        self.assertLessEqual(midnight.altitude_deg, 0.0)
+        self.assertIsNone(midnight.shadow_len_1m)
+        noon = solar_position(37.7749, 80, 12.0)
+        self.assertIsNotNone(noon.shadow_len_1m)
+        self.assertGreater(noon.shadow_len_1m, 0.0)
+
+    def test_read_ifc_true_north_deg(self) -> None:
+        ifc_30 = (
+            "ISO-10303-21;\nDATA;\n"
+            "#3=IFCAXIS2PLACEMENT3D(#1,$,$);\n"
+            "#4=IFCDIRECTION((0.5,0.8660254));\n"
+            "#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-5,#3,#4);\n"
+            "ENDSEC;\n"
+        )
+        self.assertAlmostEqual(read_ifc_true_north_deg(ifc_30), 30.0, places=2)
+
+        ifc_neg45 = ifc_30.replace("0.5,0.8660254", "-0.70710678,0.70710678")
+        self.assertAlmostEqual(read_ifc_true_north_deg(ifc_neg45), -45.0, places=2)
+
+        ifc_missing = ifc_30.replace("#4)", "$)")
+        self.assertEqual(read_ifc_true_north_deg(ifc_missing), 0.0)
+
+    def test_sun_hours_physics_equinox_closed_box_wall_and_rotated_site(self) -> None:
+        # 1. Unobstructed equinox in both N and S hemispheres gets ~12 hours.
+        for lat in (37.7749, -33.8688):
+            hrs = compute_direct_sun_hours_for_points(
+                [(0.0, 0.0, 0.0)], [], lat_deg=lat, day_of_year=80, step_minutes=15
+            )[0]
+            self.assertGreaterEqual(hrs, 11.25)
+            self.assertLessEqual(hrs, 12.25)
+
+        def _quad(a, b, c, d):
+            return [(a, b, c), (a, c, d)]
+
+        # 2. Point inside a closed roof + 4 walls box gets 0 hours.
+        closed_box = (
+            _quad((-4, -4, 3), (4, -4, 3), (4, 4, 3), (-4, 4, 3))
+            + _quad((-4, -4, 0), (4, -4, 0), (4, -4, 3), (-4, -4, 3))
+            + _quad((4, -4, 0), (4, 4, 0), (4, 4, 3), (4, -4, 3))
+            + _quad((4, 4, 0), (-4, 4, 0), (-4, 4, 3), (4, 4, 3))
+            + _quad((-4, 4, 0), (-4, -4, 0), (-4, -4, 3), (-4, 4, 3))
+        )
+        self.assertEqual(
+            compute_direct_sun_hours_for_points(
+                [(0.0, 0.0, 0.85)], closed_box, lat_deg=40.0, day_of_year=172, step_minutes=30
+            )[0],
+            0.0,
+        )
+
+        # 3. Tall east-west wall at y=0 (x in [-10,10], z in [0,8]) in winter (N hemisphere):
+        #    north side (y=+2) is shaded, south side (y=-2) receives direct sun.
+        ew_wall = _quad((-10, 0, 0), (10, 0, 0), (10, 0, 8), (-10, 0, 8))
+        h_north, h_south = compute_direct_sun_hours_for_points(
+            [(0.0, 2.0, 0.85), (0.0, -2.0, 0.85)],
+            ew_wall,
+            lat_deg=40.0,
+            day_of_year=355,
+            true_north_deg=0.0,
+            step_minutes=30,
+        )
+        self.assertGreater(h_south, h_north + 4.0)
+
+        # 4. Same geometry rotated by true_north_deg = +90° (True North is plan +X, True South is plan -X):
+        #    tall north-south wall at x=0 (y in [-10,10], z in [0,8]) shades +X side vs -X side.
+        ns_wall = _quad((0, -10, 0), (0, 10, 0), (0, 10, 8), (0, -10, 8))
+        h_tnorth, h_tsouth = compute_direct_sun_hours_for_points(
+            [(2.0, 0.0, 0.85), (-2.0, 0.0, 0.85)],
+            ns_wall,
+            lat_deg=40.0,
+            day_of_year=355,
+            true_north_deg=90.0,
+            step_minutes=30,
+        )
+        self.assertGreater(h_tsouth, h_tnorth + 4.0)
+
+    def test_passive_solar_reward_fail_closed_and_gates(self) -> None:
+        # Omitting required gate keyword arguments must raise TypeError (never silently return 1.0).
+        with self.assertRaises(TypeError):
+            compute_passive_solar_reward(4.5, 5.0)  # type: ignore[call-arg]
+        with self.assertRaises(TypeError):
+            compute_passive_solar_reward(4.5, 5.0, verify_ok=True, spec_match=1.0, has_closed_envelope=True)  # type: ignore[call-arg]
+
+        # None or invalid / failing gates must return 0.0.
+        self.assertEqual(
+            compute_passive_solar_reward(
+                5.0, 4.0, verify_ok=False, spec_match=1.0, has_closed_envelope=True, max_facade_wwr=0.25
+            ),
+            0.0,
+        )
+        self.assertEqual(
+            compute_passive_solar_reward(
+                5.0, 4.0, verify_ok=True, spec_match=0.8, has_closed_envelope=True, max_facade_wwr=0.25
+            ),
+            0.0,
+        )
+        self.assertEqual(
+            compute_passive_solar_reward(
+                5.0, 4.0, verify_ok=True, spec_match=1.0, has_closed_envelope=False, max_facade_wwr=0.25
+            ),
+            0.0,
+        )
+        self.assertEqual(
+            compute_passive_solar_reward(
+                5.0, 4.0, verify_ok=True, spec_match=1.0, has_closed_envelope=True, max_facade_wwr=0.55
+            ),
+            0.0,
+        )
+        self.assertEqual(
+            compute_passive_solar_reward(
+                5.0, 4.0, verify_ok=True, spec_match=1.0, has_closed_envelope=True, max_facade_wwr=None  # type: ignore[arg-type]
+            ),
+            0.0,
+        )
+        self.assertGreater(
+            compute_passive_solar_reward(
+                4.5, 4.0, verify_ok=True, spec_match=1.0, has_closed_envelope=True, max_facade_wwr=0.35
+            ),
+            0.8,
+        )
+
+    def test_envelope_gates_closed_open_roof_and_wwr(self) -> None:
+        base_walls = [
+            {"id": "wS", "start": (0.0, 0.0), "end": (10.0, 0.0), "height_m": 3.0},
+            {"id": "wE", "start": (10.0, 0.0), "end": (10.0, 8.0), "height_m": 3.0},
+            {"id": "wN", "start": (10.0, 8.0), "end": (0.0, 8.0), "height_m": 3.0},
+            {"id": "wW", "start": (0.0, 8.0), "end": (0.0, 0.0), "height_m": 3.0},
+        ]
+        win_25 = [{"id": "win1", "host_wall_id": "wS", "width_m": 5.0, "height_m": 1.5}]  # 7.5 / 30 = 0.25
+        floor_only = [{"id": "slab0", "base_z_m": -0.2, "top_z_m": 0.0, "is_roof_type": False}]
+        roof_slab = [{"id": "roof0", "base_z_m": 3.0, "top_z_m": 3.2, "is_roof_type": True}]
+
+        # 1. Closed loop + roof + 25% south window -> passes gates.
+        ok = envelope_gates({"walls": base_walls, "windows": win_25, "roofs": [{"id": "r1"}], "slabs": floor_only})
+        self.assertTrue(ok["storeys_closed"])
+        self.assertTrue(ok["has_roof_or_top_slab"])
+        self.assertTrue(ok["has_closed_envelope"])
+        self.assertAlmostEqual(ok["facade_wwr"]["S"], 0.25, places=3)
+        self.assertAlmostEqual(ok["max_facade_wwr"], 0.25, places=3)
+        self.assertGreater(
+            compute_passive_solar_reward(
+                4.5, 4.0, verify_ok=True, spec_match=1.0,
+                has_closed_envelope=ok["has_closed_envelope"], max_facade_wwr=ok["max_facade_wwr"],
+            ),
+            0.8,
+        )
+
+        # 2. Floor slab only (no roof / top slab) -> fails closed envelope -> reward 0.0.
+        no_roof = envelope_gates({"walls": base_walls, "windows": win_25, "roofs": [], "slabs": floor_only})
+        self.assertTrue(no_roof["storeys_closed"])
+        self.assertFalse(no_roof["has_roof_or_top_slab"])
+        self.assertFalse(no_roof["has_closed_envelope"])
+        self.assertEqual(
+            compute_passive_solar_reward(
+                4.5, 4.0, verify_ok=True, spec_match=1.0,
+                has_closed_envelope=no_roof["has_closed_envelope"], max_facade_wwr=no_roof["max_facade_wwr"],
+            ),
+            0.0,
+        )
+
+        # 3. Missing exterior south wall EVEN WITH a closed interior room inside -> storeys_closed=False!
+        open_ext_closed_int = [
+            *base_walls[1:],  # omit wS!
+            {"id": "int1", "start": (2.0, 2.0), "end": (8.0, 2.0), "height_m": 3.0},
+            {"id": "int2", "start": (8.0, 2.0), "end": (8.0, 6.0), "height_m": 3.0},
+            {"id": "int3", "start": (8.0, 6.0), "end": (2.0, 6.0), "height_m": 3.0},
+            {"id": "int4", "start": (2.0, 6.0), "end": (2.0, 2.0), "height_m": 3.0},
+        ]
+        open_res = envelope_gates({"walls": open_ext_closed_int, "windows": [], "roofs": [{"id": "r1"}], "slabs": floor_only})
+        self.assertFalse(open_res["storeys_closed"])
+        self.assertFalse(open_res["has_closed_envelope"])
+
+        # 4. Over-glazed facade (60% WWR on south wall) -> reward fails closed with 0.0.
+        win_60 = [{"id": "win_big", "host_wall_id": "wS", "width_m": 9.0, "height_m": 2.0}]  # 18 / 30 = 0.60
+        over = envelope_gates({"walls": base_walls, "windows": win_60, "roofs": [], "slabs": roof_slab})
+        self.assertTrue(over["has_closed_envelope"])
+        self.assertAlmostEqual(over["max_facade_wwr"], 0.60, places=3)
+        self.assertEqual(
+            compute_passive_solar_reward(
+                4.5, 4.0, verify_ok=True, spec_match=1.0,
+                has_closed_envelope=over["has_closed_envelope"], max_facade_wwr=over["max_facade_wwr"],
+            ),
+            0.0,
+        )
+
+        # 5. Rotated site: true_north_deg = +90° (True North is Plan +X -> Plan -X outward wall wW faces True South).
+        win_on_wW = [{"id": "winW", "host_wall_id": "wW", "width_m": 4.0, "height_m": 1.5}]  # 6 / 24 = 0.25
+        rot = envelope_gates({"walls": base_walls, "windows": win_on_wW, "roofs": [{"id": "r1"}], "true_north_deg": 90.0})
+        self.assertAlmostEqual(rot["facade_wwr"]["S"], 0.25, places=3)
+        self.assertEqual(rot["facade_wwr"]["W"], 0.0)
+
+        # 6. Synthetic IFC STEP string round-trip.
+        step_ifc = """ISO-10303-21;
+DATA;
+#1=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#2=IFCCARTESIANPOINT((0.,0.,0.));
+#3=IFCAXIS2PLACEMENT3D(#2,$,$);
+#4=IFCDIRECTION((0.,1.));
+#5=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-5,#3,#4);
+#10=IFCLOCALPLACEMENT($,#3);
+#20=IFCAXIS2PLACEMENT3D(#2,$,#4);
+#21=IFCCARTESIANPOINT((5000.,0.,0.));
+#22=IFCAXIS2PLACEMENT2D(#21,$);
+#23=IFCRECTANGLEPROFILEDEF(.AREA.,$,#22,10000.,200.);
+#24=IFCEXTRUDEDAREASOLID(#23,#3,#4,3000.);
+#25=IFCSHAPEREPRESENTATION($,'Body','SweptSolid',(#24));
+#26=IFCPRODUCTDEFINITIONSHAPE($,$,(#25));
+#30=IFCCARTESIANPOINT((0.,0.,0.));
+#31=IFCAXIS2PLACEMENT3D(#30,#32,#33);
+#32=IFCDIRECTION((0.,0.,1.));
+#33=IFCDIRECTION((1.,0.,0.));
+#34=IFCLOCALPLACEMENT(#10,#31);
+#35=IFCWALL('w1',$,'Wall',$,$,#34,#26,$,$);
+#40=IFCCARTESIANPOINT((10000.,0.,0.));
+#41=IFCDIRECTION((0.,1.,0.));
+#42=IFCAXIS2PLACEMENT3D(#40,#32,#41);
+#43=IFCLOCALPLACEMENT(#10,#42);
+#44=IFCCARTESIANPOINT((4000.,0.,0.));
+#45=IFCAXIS2PLACEMENT2D(#44,$);
+#46=IFCRECTANGLEPROFILEDEF(.AREA.,$,#45,8000.,200.);
+#47=IFCEXTRUDEDAREASOLID(#46,#3,#32,3000.);
+#48=IFCSHAPEREPRESENTATION($,'Body','SweptSolid',(#47));
+#49=IFCPRODUCTDEFINITIONSHAPE($,$,(#48));
+#50=IFCWALL('w2',$,'Wall',$,$,#43,#49,$,$);
+#60=IFCCARTESIANPOINT((10000.,8000.,0.));
+#61=IFCDIRECTION((-1.,0.,0.));
+#62=IFCAXIS2PLACEMENT3D(#60,#32,#61);
+#63=IFCLOCALPLACEMENT(#10,#62);
+#64=IFCWALL('w3',$,'Wall',$,$,#63,#26,$,$);
+#70=IFCCARTESIANPOINT((0.,8000.,0.));
+#71=IFCDIRECTION((0.,-1.,0.));
+#72=IFCAXIS2PLACEMENT3D(#70,#32,#71);
+#73=IFCLOCALPLACEMENT(#10,#72);
+#74=IFCWALL('w4',$,'Wall',$,$,#73,#49,$,$);
+#80=IFCOPENINGELEMENT('op1',$,$,$,$,#34,$,$);
+#81=IFCRELVOIDSELEMENT('rv1',$,$,$,#35,#80);
+#82=IFCWINDOW('win1',$,$,$,$,#34,$,$,1500.,4000.,$,$,$);
+#83=IFCRELFILLSELEMENT('rf1',$,$,$,#80,#82);
+#90=IFCROOF('r1',$,$,$,$,#10,$,$);
+ENDSEC;
+"""
+        ifc_gates = envelope_gates(step_ifc)
+        self.assertTrue(ifc_gates["has_closed_envelope"])
+        self.assertEqual(ifc_gates["exterior_wall_count"], 4)
+        self.assertAlmostEqual(ifc_gates["facade_wwr"]["S"], 0.2, places=3)  # 6 m² / 30 m² = 0.20
+
+
+class TestSketchEngine(unittest.TestCase):
+    def test_all_topologies_generate_valid_scripts_and_bounds(self) -> None:
+        self.assertEqual(len(SKETCH_TOPOLOGIES), 6)
+        for idx, topo in enumerate(SKETCH_TOPOLOGIES):
+            sample = generate_sketch_sample(2000 + idx, topology=topo)
+            self.assertEqual(sample.topology, topo)
+            self.assertIn('from "@permitzip/bim-script"', sample.ts_source)
+            self.assertIn("export default defineScript(", sample.ts_source)
+            self.assertIn("units.ft", sample.ts_source)
+            self.assertGreaterEqual(len(sample.rooms), 2)
+            self.assertGreaterEqual(len(sample.walls), 5)
+            self.assertGreaterEqual(len(sample.openings), 3)
+            for op in sample.openings:
+                self.assertGreaterEqual(op.along_ft, 2.0)
+
+    def test_determinism_and_batch(self) -> None:
+        a = generate_sketch_sample(4242, topology="l_shaped_studio")
+        b = generate_sketch_sample(4242, topology="l_shaped_studio")
+        self.assertEqual(a.ts_source, b.ts_source)
+        batch = generate_sketch_dataset_specs(12, start_seed=100)
+        self.assertEqual(len(batch), 12)
+        self.assertEqual({s.topology for s in batch}, set(SKETCH_TOPOLOGIES))
+
+    def test_render_parametric_sketch_svg_styles(self) -> None:
+        sample = generate_sketch_sample(500, topology="boutique_cafe")
+        for style in SKETCH_STYLES:
+            svg = render_parametric_sketch_svg(sample, style=style)
+            self.assertTrue(svg.startswith("<svg"))
+            self.assertTrue(svg.endswith("</svg>"))
+            self.assertIn("<path", svg)
+            self.assertIn("CAFE SEATING", svg)
 
 
 if __name__ == "__main__":

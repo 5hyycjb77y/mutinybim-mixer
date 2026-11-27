@@ -85,6 +85,16 @@
       "pack": "bim-first-party",
       "example": null,
       "description": "Multi-trade spatial coordination adapter trained via GRPO directly against bim-lint and bim-calc."
+    },
+    "vision_floorplan": {
+      "pack": "bim-pack-architecture",
+      "example": "small-office",
+      "description": "Multimodal napkin-sketch/floorplan-to-MutinyBIM adapter trained on language_model layers (vision tower frozen) so it composes cleanly in weight space with all trade LoRAs."
+    },
+    "passive_solar": {
+      "pack": "bim-pack-architecture",
+      "example": "small-office",
+      "description": "Passive-solar exposure (orientation, window-to-wall ratio capped <= 40%, closed-envelope gated) evaluated via solar_engine direct sun hours."
     }
   },
   "reward_weights": {

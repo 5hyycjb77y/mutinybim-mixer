@@ -14,7 +14,8 @@ Instead of pooling Colab credits into one shared VM, everyone adopts a construct
 | :--- | :--- | :--- | :--- |
 | **`01_train_trade_lora.ipynb`** | Pick a trade (`architecture`, `mechanical`, `plumbing`, `electrical`, `drafting`, `structural`, `fire_protection`, `clash_negation`, `coord_rlvr`) → SFT + RLVR (`GRPOTrainer`) against live MutinyBIM → push ~50 MB LoRA + scorecard to HF | **A100 (40GB / 80GB)** | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/5hyycjb77y/mutinybim-mixer/blob/main/notebooks/01_train_trade_lora.ipynb) |
 | **`02_weight_space_mixer.ipynb`** | Pull community trade LoRAs → blend via Linear / TIES / DARE + `-λ·ΔW_clash` → inspect 60-layer SVD diagnostics → run CMA-ES EvoMerge against `bim-lint` → optional local inference preview | **L4 (24GB)** | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/5hyycjb77y/mutinybim-mixer/blob/main/notebooks/02_weight_space_mixer.ipynb) |
-| **`03_vibe_architect_studio.ipynb`** | **For architects, designers & vibe coders:** Launch a Gradio studio app (sketch/prompt → real MutinyBIM IFC 4.3 + SVG/PDF sheets + interactive 3D GLB + geometry-locked SDXL/FLUX photoreal render + Vision Critique & Redraw) | **L4 (24GB)** | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/5hyycjb77y/mutinybim-mixer/blob/main/notebooks/03_vibe_architect_studio.ipynb) |
+| **`03_vibe_architect_studio.ipynb`** | **For architects, designers & vibe coders (Mixtape Edition):** Gradio studio app (sketch/prompt or Instant Showcase → real MutinyBIM IFC 4.3 + SVG/PDF sheets + 360° orbit GIF + interactive 3D GLB + 3-track Mixtape A/B strip + 4-shot photoreal storyboard + Vision Critique + ☀️ Solar Dome & Sun Hours) | **L4 (24GB)** | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/5hyycjb77y/mutinybim-mixer/blob/main/notebooks/03_vibe_architect_studio.ipynb) |
+| **`04_sketch_to_bim_lora.ipynb`** | **Self-supervised Sketch → BIM trainer:** Generate infinite verified `(napkin sketch, @permitzip/bim-script)` pairs across 6 topologies and train a weight-space-compatible `vision_floorplan` LoRA | **A100 (40GB / 80GB)** | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/5hyycjb77y/mutinybim-mixer/blob/main/notebooks/04_sketch_to_bim_lora.ipynb) |
 
 ---
 
@@ -67,12 +68,15 @@ mutinybim-mixer/
 │   ├── lora_ops.py                   # Exact dense-delta LoRA arithmetic, TIES, DARE, SVD factorizer & diagnostics
 │   ├── evomerge.py                   # CMA-ES (with zero-dep NES fallback) 60-layer EvoMerge optimizer
 │   ├── prompts.py                    # Single-trade training prompts + 6-task MULTI_TRADE_BENCHMARK
-│   ├── studio_render.py              # IFC → GLB + headless depth/clay + ControlNet photoreal + SVG→PNG helpers
+│   ├── sketch_engine.py              # Self-supervised parametric floor plans + organic napkin-sketch generator
+│   ├── solar_engine.py               # Geolocation + solstice/equinox Sun-Dial HUD + 3D Solar Dome + Direct Sun Hours
+│   ├── studio_render.py              # IFC → GLB + depth/clay + turntable GIF + 4-shot storyboard + Mixtape presets
 │   └── mcp_bridge.py                 # Streamable HTTP MCP bridge to live `mutinybim-mcp` & `bim-editor`
 ├── notebooks/
 │   ├── 01_train_trade_lora.ipynb     # One-click Colab trainer (SFT + RLVR GRPO)
 │   ├── 02_weight_space_mixer.ipynb   # One-click Colab weight-space mixer + SVD plots + EvoMerge + server
-│   └── 03_vibe_architect_studio.ipynb # One-click Gradio Studio: sketch/vibe → IFC/PDF/GLB + photoreal render
+│   ├── 03_vibe_architect_studio.ipynb # Mixtape Edition Studio: sketch/showcase → IFC/PDF/GLB/GIF + Solar Dome
+│   └── 04_sketch_to_bim_lora.ipynb   # Self-supervised Napkin Sketch -> MutinyBIM multimodal LoRA trainer
 └── tests/
     └── test_mixer.py                 # Zero-dependency unit tests
 ```

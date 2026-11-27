@@ -422,6 +422,14 @@ async function evaluateOne(req, options = {}) {
   return result;
 }
 
+function slugify(name) {
+  const cleaned = String(name || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return cleaned || "mutinybim-model";
+}
+
 async function exportBundle(req) {
   const evalResult = await evaluateOne(req, { includeFinalModel: true });
   const { _finalModel: finalModel, _scriptHash: scriptHash, ...publicEval } = evalResult;
@@ -436,6 +444,8 @@ async function exportBundle(req) {
   }
 
   const projectName = String(req?.project_name || "Vibe Architect Studio");
+  const timeStamp = typeof req?.time_stamp === "string" && req.time_stamp ? req.time_stamp : new Date().toISOString();
+  const fileName = typeof req?.file_name === "string" && req.file_name ? req.file_name : `${slugify(projectName)}.ifc`;
   let ifcText = null;
   let ifcReport = null;
   if (req?.include_ifc !== false) {
@@ -443,7 +453,8 @@ async function exportBundle(req) {
       const ifc = exportIfc({
         model: finalModel,
         project: { id: "vibe-studio", name: projectName },
-        timeStamp: "2026-01-01T00:00:00.000Z",
+        timeStamp,
+        fileName,
       });
       ifcText = ifc.text;
       ifcReport = ifc.report;

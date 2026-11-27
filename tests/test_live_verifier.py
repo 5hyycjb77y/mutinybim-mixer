@@ -11,6 +11,7 @@ from urllib.error import URLError
 
 from verifier.verify_client import MutinyVerifierClient
 from mixer.lora_ops import load_spec
+from mixer.solar_engine import envelope_gates, read_ifc_true_north_deg
 
 ROOT = Path(__file__).resolve().parent.parent
 CHECKOUT = os.environ.get("MIXER_TEST_MUTINYBIM")
@@ -48,6 +49,14 @@ class TestLiveVerifier(unittest.TestCase):
                 bundle = client.export_bundle(examples["small-office"], project_name="Synthetic office")
                 self.assertTrue(bundle.verify.ok, bundle.verify.error)
                 self.assertIn("IFC4X3", bundle.ifc_text or "")
+                self.assertIn("IFCGEOMETRICREPRESENTATIONCONTEXT", bundle.ifc_text or "")
+                self.assertEqual(read_ifc_true_north_deg(bundle.ifc_text or ""), 0.0)
+                gates = envelope_gates(bundle.ifc_text or "")
+                self.assertTrue(gates["storeys_closed"], gates)
+                self.assertGreaterEqual(gates["exterior_wall_count"], 4)
+                self.assertGreaterEqual(gates["max_facade_wwr"], 0.0)
+                self.assertLessEqual(gates["max_facade_wwr"], 1.0)
+                self.assertEqual(gates["true_north_deg"], 0.0)
                 self.assertEqual(len(bundle.sheets), 2)
                 self.assertTrue(base64.b64decode(bundle.pdf_base64 or "").startswith(b"%PDF"))
             finally:

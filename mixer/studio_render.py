@@ -8,6 +8,7 @@ functions so tests and lightweight tools work without GPU packages.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any
 
@@ -72,6 +73,14 @@ CAMERA_PRESETS: dict[str, dict[str, Any]] = {
         "hide_cutaway_classes": (),
         "prompt_hint": "eye-level wide-angle interior architectural perspective looking across the space",
     },
+    "opposite_interior": {
+        "label": "Opposite Interior Angle",
+        "projection": "perspective",
+        "elevation_deg": 6.0,
+        "azimuth_deg": -145.0,
+        "hide_cutaway_classes": (),
+        "prompt_hint": "reverse eye-level interior architectural view looking back across the room toward daylight windows",
+    },
     "corner_axonometric": {
         "label": "Exterior Corner Axonometric",
         "projection": "ortho",
@@ -116,6 +125,36 @@ VIBE_INSPIRATION_CHIPS: list[dict[str, str]] = [
     },
 ]
 
+MIXTAPE_PRESETS: dict[str, dict[str, Any]] = {
+    "Timber / Brutalist / Watercolor Trio": {
+        "mode": "style_trio",
+        "description": "Same exact IFC geometry rendered across 3 distinct architectural art directions.",
+        "tracks": [
+            {"label": "Track A: Golden Hour Timber", "style": "ArchDaily Golden Hour Timber"},
+            {"label": "Track B: Brutalist Daylight", "style": "Brutalist Concrete & Diffused Daylight"},
+            {"label": "Track C: Competition Watercolor", "style": "Architectural Watercolor & Ink Cutaway"},
+        ],
+    },
+    "Daylight / Exposed MEP / Golden Hour": {
+        "mode": "style_trio",
+        "description": "Compare Scandinavian studio daylight, moody exposed MEP, and warm timber.",
+        "tracks": [
+            {"label": "Track A: Scandinavian Studio", "style": "Scandinavian Minimalist Studio"},
+            {"label": "Track B: Moody Exposed MEP", "style": "Moody Hospitality & Exposed MEP"},
+            {"label": "Track C: Golden Hour Timber", "style": "ArchDaily Golden Hour Timber"},
+        ],
+    },
+    "Weight-Space LoRA Fader Sweep": {
+        "mode": "weight_sweep",
+        "description": "Blend community trade LoRAs at 3 fader settings to visualize weight-space programming.",
+        "tracks": [
+            {"label": "Track A: Minimal Arch (1.2 / 0.2 / 0.0)", "faders": (1.2, 0.2, 0.0)},
+            {"label": "Track B: Balanced Multi-Trade (0.9 / 0.8 / 0.3)", "faders": (0.9, 0.8, 0.3)},
+            {"label": "Track C: Max MEP + ClashNeg (0.8 / 1.1 / 0.6)", "faders": (0.8, 1.1, 0.6)},
+        ],
+    },
+}
+
 
 def build_render_prompt(user_vibe: str, style_key: str, camera_key: str) -> tuple[str, str]:
     """Build `(positive_prompt, negative_prompt)` combining user vibe, art direction, and camera framing."""
@@ -154,19 +193,164 @@ def _color_for_ifc_class(ifc_class: str) -> tuple[int, int, int, int]:
     return (210, 208, 204, 255)
 
 
+def _clip_near(
+    poly: list[tuple[float, float, float]],
+    near: float = 0.05,
+) -> list[tuple[float, float, float]]:
+    """Sutherland-Hodgman polygon clip against view-space plane ``z >= near``."""
+    out: list[tuple[float, float, float]] = []
+    n = len(poly)
+    for i, a in enumerate(poly):
+        b = poly[(i + 1) % n]
+        a_in = a[2] >= near
+        b_in = b[2] >= near
+        if a_in:
+            out.append(a)
+        if a_in != b_in:
+            dz = b[2] - a[2]
+            t = (near - a[2]) / dz if abs(dz) > 1e-12 else 0.0
+            out.append(
+                (
+                    a[0] + t * (b[0] - a[0]),
+                    a[1] + t * (b[1] - a[1]),
+                    near,
+                )
+            )
+    return out
+
+
+def _vec_dot(a: tuple[float, float, float], b: tuple[float, float, float]) -> float:
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def _vec_sub(a: tuple[float, float, float], b: tuple[float, float, float]) -> tuple[float, float, float]:
+    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+
+
+def _vec_cross(a: tuple[float, float, float], b: tuple[float, float, float]) -> tuple[float, float, float]:
+    return (
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
+
+
+def _vec_norm(a: tuple[float, float, float]) -> tuple[float, float, float]:
+    mag = math.sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2])
+    if mag < 1e-8:
+        return (0.0, 0.0, 0.0)
+    return (a[0] / mag, a[1] / mag, a[2] / mag)
+
+
+def compute_camera_pose(
+    vmin: tuple[float, float, float] | list[float],
+    vmax: tuple[float, float, float] | list[float],
+    camera_preset: str,
+    *,
+    storey_elevations_m: list[float] | None = None,
+    storey_index: int = 0,
+    width: int = 1024,
+    height: int = 768,
+    azimuth_override: float | None = None,
+    elevation_override: float | None = None,
+) -> dict[str, Any]:
+    """Compute camera basis, eye/target coordinates, and constant ortho scale."""
+    cam = CAMERA_PRESETS.get(camera_preset, CAMERA_PRESETS["isometric_cutaway"])
+    vmin_t = (float(vmin[0]), float(vmin[1]), float(vmin[2]))
+    vmax_t = (float(vmax[0]), float(vmax[1]), float(vmax[2]))
+    center = (
+        0.5 * (vmin_t[0] + vmax_t[0]),
+        0.5 * (vmin_t[1] + vmax_t[1]),
+        0.5 * (vmin_t[2] + vmax_t[2]),
+    )
+    dx = vmax_t[0] - vmin_t[0]
+    dy = vmax_t[1] - vmin_t[1]
+    dz = vmax_t[2] - vmin_t[2]
+    extent = max(math.sqrt(dx * dx + dy * dy + dz * dz), 1.0)
+    radius = 0.5 * extent
+
+    az = math.radians(cam["azimuth_deg"] if azimuth_override is None else azimuth_override)
+    el = math.radians(cam["elevation_deg"] if elevation_override is None else elevation_override)
+    cam_dir = (
+        math.cos(el) * math.cos(az),
+        math.cos(el) * math.sin(az),
+        math.sin(el),
+    )
+
+    if cam["projection"] == "perspective":
+        if storey_elevations_m:
+            s_idx = min(max(0, storey_index), len(storey_elevations_m) - 1)
+            eye_z = float(storey_elevations_m[s_idx]) + 1.6
+        else:
+            eye_z = vmin_t[2] + 1.6
+        eye = (
+            center[0] - 0.18 * extent * math.cos(az),
+            center[1] - 0.18 * extent * math.sin(az),
+            eye_z,
+        )
+        target = (
+            center[0] + 0.25 * extent * math.cos(az),
+            center[1] + 0.25 * extent * math.sin(az),
+            eye_z,
+        )
+    else:
+        eye = (
+            center[0] + cam_dir[0] * (1.8 * extent),
+            center[1] + cam_dir[1] * (1.8 * extent),
+            center[2] + cam_dir[2] * (1.8 * extent),
+        )
+        target = center
+
+    forward = _vec_norm(_vec_sub(target, eye))
+    world_up = (0.0, 0.0, 1.0)
+    right = _vec_cross(forward, world_up)
+    if math.sqrt(_vec_dot(right, right)) < 1e-6:
+        right = (1.0, 0.0, 0.0)
+    else:
+        right = _vec_norm(right)
+    up = _vec_norm(_vec_cross(right, forward))
+
+    # Bounding-sphere constant ortho scale avoids 15% zoom pumping during turntables.
+    px_scale = 0.86 * min(width, height) / (2.0 * radius)
+    rel_center = _vec_sub(center, eye)
+    cx_world = _vec_dot(rel_center, right)
+    cy_world = _vec_dot(rel_center, up)
+    fov = math.radians(68.0)
+    focal = (0.5 * height) / math.tan(0.5 * fov)
+
+    return {
+        "projection": cam["projection"],
+        "eye": eye,
+        "target": target,
+        "center": center,
+        "extent": extent,
+        "radius": radius,
+        "forward": forward,
+        "right": right,
+        "up": up,
+        "px_scale": px_scale,
+        "cx_world": cx_world,
+        "cy_world": cy_world,
+        "focal": focal,
+    }
+
+
 def _rasterize_camera_views(
     meshes: list[tuple[Any, tuple[int, int, int, int]]],
     *,
     camera_preset: str,
     width: int,
     height: int,
+    azimuth_override: float | None = None,
+    elevation_override: float | None = None,
+    storey_elevations_m: list[float] | None = None,
+    storey_index: int = 0,
+    light_dir_override: tuple[float, float, float] | list[float] | None = None,
 ) -> tuple[Any, Any]:
     """Pure-NumPy headless software z-buffer rasterizer producing `(depth_pil, clay_pil)`."""
-    import math
     import numpy as np
     from PIL import Image
 
-    cam = CAMERA_PRESETS.get(camera_preset, CAMERA_PRESETS["isometric_cutaway"])
     if not meshes:
         blank_d = Image.fromarray(np.zeros((height, width), dtype=np.uint8), mode="L")
         blank_c = Image.fromarray(np.full((height, width, 3), 245, dtype=np.uint8), mode="RGB")
@@ -175,58 +359,84 @@ def _rasterize_camera_views(
     all_verts = np.vstack([m.vertices for m, _ in meshes])
     vmin = all_verts.min(axis=0)
     vmax = all_verts.max(axis=0)
-    center = (vmin + vmax) * 0.5
-    extent = float(np.linalg.norm(vmax - vmin))
-    extent = max(extent, 1.0)
-
-    az = math.radians(cam["azimuth_deg"])
-    el = math.radians(cam["elevation_deg"])
-    # Camera direction pointing from target toward eye (Z-up architectural frame).
-    cam_dir = np.array(
-        [
-            math.cos(el) * math.cos(az),
-            math.cos(el) * math.sin(az),
-            math.sin(el),
-        ],
-        dtype=np.float64,
+    pose = compute_camera_pose(
+        vmin.tolist(),
+        vmax.tolist(),
+        camera_preset,
+        storey_elevations_m=storey_elevations_m,
+        storey_index=storey_index,
+        width=width,
+        height=height,
+        azimuth_override=azimuth_override,
+        elevation_override=elevation_override,
     )
-    if cam["projection"] == "perspective":
-        # Place camera inside/near center looking outward across the room.
-        eye = center + np.array([-0.22 * extent * math.cos(az), -0.22 * extent * math.sin(az), 0.05 * extent])
-        target = center + np.array([0.25 * extent * math.cos(az), 0.25 * extent * math.sin(az), -0.02 * extent])
+    eye = np.array(pose["eye"], dtype=np.float64)
+    forward = np.array(pose["forward"], dtype=np.float64)
+    right = np.array(pose["right"], dtype=np.float64)
+    up = np.array(pose["up"], dtype=np.float64)
+
+    if light_dir_override is not None:
+        light_dir = np.array(light_dir_override, dtype=np.float64)
     else:
-        eye = center + cam_dir * (1.8 * extent)
-        target = center
-
-    forward = target - eye
-    forward /= max(float(np.linalg.norm(forward)), 1e-8)
-    world_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-    right = np.cross(forward, world_up)
-    if np.linalg.norm(right) < 1e-6:
-        right = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-    right /= np.linalg.norm(right)
-    up = np.cross(right, forward)
-    up /= np.linalg.norm(up)
-
-    light_dir = np.array([0.45, 0.35, 0.82], dtype=np.float64)
-    light_dir /= np.linalg.norm(light_dir)
+        light_dir = np.array([0.45, 0.35, 0.82], dtype=np.float64)
+    light_norm = float(np.linalg.norm(light_dir))
+    light_dir = light_dir / max(light_norm, 1e-8)
 
     zbuf = np.full((height, width), np.inf, dtype=np.float32)
     cbuf = np.full((height, width, 3), 244, dtype=np.uint8)
 
-    # Pre-project to compute orthographic scale cleanly if ortho.
-    if cam["projection"] == "ortho":
-        rel_all = all_verts - eye
-        rx = rel_all @ right
-        ry = rel_all @ up
-        span_x = max(float(rx.max() - rx.min()), 1e-3)
-        span_y = max(float(ry.max() - ry.min()), 1e-3)
-        px_scale = 0.86 * min(width / span_x, height / span_y)
-        cx_world = 0.5 * float(rx.min() + rx.max())
-        cy_world = 0.5 * float(ry.min() + ry.max())
-    else:
-        fov = math.radians(68.0)
-        focal = (0.5 * height) / math.tan(0.5 * fov)
+    is_ortho = pose["projection"] == "ortho"
+    px_scale = float(pose["px_scale"])
+    cx_world = float(pose["cx_world"])
+    cy_world = float(pose["cy_world"])
+    focal = float(pose["focal"])
+    near_plane = 0.05
+
+    def _raster_tri_2d(
+        x0: float,
+        y0: float,
+        z0: float,
+        x1: float,
+        y1: float,
+        z1: float,
+        x2: float,
+        y2: float,
+        z2: float,
+        shaded: Any,
+        perspective: bool,
+    ) -> None:
+        denom = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2)
+        if abs(denom) < 1e-5:
+            return
+        min_x = max(0, int(math.floor(min(x0, x1, x2))))
+        max_x = min(width - 1, int(math.ceil(max(x0, x1, x2))))
+        min_y = max(0, int(math.floor(min(y0, y1, y2))))
+        max_y = min(height - 1, int(math.ceil(max(y0, y1, y2))))
+        if max_x < min_x or max_y < min_y:
+            return
+
+        gx = np.arange(min_x, max_x + 1, dtype=np.float32)[None, :] + 0.5
+        gy = np.arange(min_y, max_y + 1, dtype=np.float32)[:, None] + 0.5
+        w0 = ((y1 - y2) * (gx - x2) + (x2 - x1) * (gy - y2)) / denom
+        w1 = ((y2 - y0) * (gx - x2) + (x0 - x2) * (gy - y2)) / denom
+        w2 = 1.0 - w0 - w1
+        inside = (w0 >= -1e-4) & (w1 >= -1e-4) & (w2 >= -1e-4)
+        if not np.any(inside):
+            return
+
+        if perspective:
+            inv_z = w0 * (1.0 / z0) + w1 * (1.0 / z1) + w2 * (1.0 / z2)
+            pz = 1.0 / np.maximum(inv_z, 1e-6)
+        else:
+            pz = w0 * z0 + w1 * z1 + w2 * z2
+
+        patch_z = zbuf[min_y : max_y + 1, min_x : max_x + 1]
+        vis = inside & (pz < patch_z)
+        if not np.any(vis):
+            return
+        patch_z[vis] = pz[vis]
+        patch_c = cbuf[min_y : max_y + 1, min_x : max_x + 1]
+        patch_c[vis] = shaded
 
     for mesh, rgba in meshes:
         verts = mesh.vertices
@@ -238,59 +448,70 @@ def _rasterize_camera_views(
         vy = rel @ up
         vz = rel @ forward
 
-        if cam["projection"] == "ortho":
+        if is_ortho:
             sx = (vx - cx_world) * px_scale + width * 0.5
             sy = height * 0.5 - (vy - cy_world) * px_scale
-        else:
-            safe_z = np.maximum(vz, 0.05)
-            sx = (vx / safe_z) * focal + width * 0.5
-            sy = height * 0.5 - (vy / safe_z) * focal
 
         tri_normals = mesh.face_normals
         base_rgb = np.array(rgba[:3], dtype=np.float32)
 
         for fi, face in enumerate(faces):
             i0, i1, i2 = int(face[0]), int(face[1]), int(face[2])
-            z0, z1, z2 = float(vz[i0]), float(vz[i1]), float(vz[i2])
-            if cam["projection"] == "perspective" and (z0 <= 0.05 or z1 <= 0.05 or z2 <= 0.05):
-                continue
-
-            x0, y0 = float(sx[i0]), float(sy[i0])
-            x1, y1 = float(sx[i1]), float(sy[i1])
-            x2, y2 = float(sx[i2]), float(sy[i2])
-
-            denom = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2)
-            if abs(denom) < 1e-5:
-                continue
-
-            min_x = max(0, int(math.floor(min(x0, x1, x2))))
-            max_x = min(width - 1, int(math.ceil(max(x0, x1, x2))))
-            min_y = max(0, int(math.floor(min(y0, y1, y2))))
-            max_y = min(height - 1, int(math.ceil(max(y0, y1, y2))))
-            if max_x < min_x or max_y < min_y:
-                continue
-
-            gx = np.arange(min_x, max_x + 1, dtype=np.float32)[None, :] + 0.5
-            gy = np.arange(min_y, max_y + 1, dtype=np.float32)[:, None] + 0.5
-            w0 = ((y1 - y2) * (gx - x2) + (x2 - x1) * (gy - y2)) / denom
-            w1 = ((y2 - y0) * (gx - x2) + (x0 - x2) * (gy - y2)) / denom
-            w2 = 1.0 - w0 - w1
-            inside = (w0 >= -1e-4) & (w1 >= -1e-4) & (w2 >= -1e-4)
-            if not np.any(inside):
-                continue
-
-            pz = w0 * z0 + w1 * z1 + w2 * z2
-            patch_z = zbuf[min_y : max_y + 1, min_x : max_x + 1]
-            vis = inside & (pz < patch_z)
-            if not np.any(vis):
-                continue
-
-            patch_z[vis] = pz[vis]
-            ndotl = abs(float(np.dot(tri_normals[fi], light_dir)))
-            shade = 0.42 + 0.58 * ndotl
+            if light_dir_override is not None:
+                ndotl = max(0.0, float(np.dot(tri_normals[fi], light_dir)))
+                shade = 0.25 + 0.75 * ndotl
+            else:
+                ndotl = abs(float(np.dot(tri_normals[fi], light_dir)))
+                shade = 0.42 + 0.58 * ndotl
             shaded = np.clip(base_rgb * shade, 0, 255).astype(np.uint8)
-            patch_c = cbuf[min_y : max_y + 1, min_x : max_x + 1]
-            patch_c[vis] = shaded
+
+            if is_ortho:
+                _raster_tri_2d(
+                    float(sx[i0]),
+                    float(sy[i0]),
+                    float(vz[i0]),
+                    float(sx[i1]),
+                    float(sy[i1]),
+                    float(vz[i1]),
+                    float(sx[i2]),
+                    float(sy[i2]),
+                    float(vz[i2]),
+                    shaded,
+                    perspective=False,
+                )
+            else:
+                poly_vs = [
+                    (float(vx[i0]), float(vy[i0]), float(vz[i0])),
+                    (float(vx[i1]), float(vy[i1]), float(vz[i1])),
+                    (float(vx[i2]), float(vy[i2]), float(vz[i2])),
+                ]
+                clipped = _clip_near(poly_vs, near=near_plane)
+                if len(clipped) < 3:
+                    continue
+                proj = [
+                    (
+                        (p[0] / p[2]) * focal + width * 0.5,
+                        height * 0.5 - (p[1] / p[2]) * focal,
+                        p[2],
+                    )
+                    for p in clipped
+                ]
+                p0 = proj[0]
+                for k in range(1, len(proj) - 1):
+                    p1, p2 = proj[k], proj[k + 1]
+                    _raster_tri_2d(
+                        p0[0],
+                        p0[1],
+                        p0[2],
+                        p1[0],
+                        p1[1],
+                        p1[2],
+                        p2[0],
+                        p2[1],
+                        p2[2],
+                        shaded,
+                        perspective=True,
+                    )
 
     valid = np.isfinite(zbuf)
     depth_img = np.zeros((height, width), dtype=np.uint8)
@@ -305,31 +526,30 @@ def _rasterize_camera_views(
     return Image.fromarray(depth_img, mode="L"), Image.fromarray(cbuf, mode="RGB")
 
 
-def ifc_to_glb_and_control(
+def _load_ifc_scene_and_meshes(
     ifc_path: str | Path,
-    out_dir: str | Path,
-    *,
-    camera_preset: str = "isometric_cutaway",
-    width: int = 1024,
-    height: int = 768,
-) -> dict[str, str | None]:
-    """Convert an IFC 4.3 file into an interactive ``model.glb`` + headless ``depth.png`` and ``clay.png``."""
+) -> tuple[Any, list[tuple[str, Any, tuple[int, int, int, int]]], list[float]]:
+    """Parse an IFC 4.3 file once into `(trimesh.Scene, labeled_meshes, storey_elevations_m)`."""
     import ifcopenshell  # type: ignore
     import ifcopenshell.geom  # type: ignore
+    import ifcopenshell.util.unit  # type: ignore
     import numpy as np
     import trimesh  # type: ignore
 
-    out_path = Path(out_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
-
     ifc_file = ifcopenshell.open(str(ifc_path))
+    unit_scale = float(ifcopenshell.util.unit.calculate_unit_scale(ifc_file) or 1.0)
+    storey_elevations_m = sorted(
+        float(st.Elevation) * unit_scale
+        for st in ifc_file.by_type("IfcBuildingStorey")
+        if getattr(st, "Elevation", None) is not None
+    )
+
     settings = ifcopenshell.geom.settings()
     settings.set(settings.USE_WORLD_COORDS, True)
 
     scene = trimesh.Scene()
-    cam = CAMERA_PRESETS.get(camera_preset, CAMERA_PRESETS["isometric_cutaway"])
-    hidden_prefixes = tuple(cam.get("hide_cutaway_classes") or ())
-    control_meshes: list[tuple[Any, tuple[int, int, int, int]]] = []
+    labeled_meshes: list[tuple[str, Any, tuple[int, int, int, int]]] = []
+    slab_top_zs: list[float] = []
 
     for product in ifc_file.by_type("IfcProduct"):
         if product.Representation is None:
@@ -345,26 +565,59 @@ def ifc_to_glb_and_control(
             continue
 
         ifc_cls = product.is_a()
+        if ifc_cls.startswith("IfcSlab"):
+            slab_top_zs.append(float(verts[:, 2].max()))
         rgba = _color_for_ifc_class(ifc_cls)
         mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
         mesh.visual.face_colors = np.tile(np.array(rgba, dtype=np.uint8), (len(faces), 1))
         scene.add_geometry(mesh, node_name=f"{ifc_cls}_{product.id()}")
+        labeled_meshes.append((ifc_cls, mesh, rgba))
 
-        if not (hidden_prefixes and any(ifc_cls.startswith(p) for p in hidden_prefixes)):
-            control_meshes.append((mesh, rgba))
+    if not storey_elevations_m and slab_top_zs:
+        storey_elevations_m = [min(slab_top_zs)]
 
+    return scene, labeled_meshes, storey_elevations_m
+
+
+def _filter_meshes_for_camera(
+    labeled_meshes: list[tuple[str, Any, tuple[int, int, int, int]]],
+    camera_preset: str,
+) -> list[tuple[Any, tuple[int, int, int, int]]]:
+    cam = CAMERA_PRESETS.get(camera_preset, CAMERA_PRESETS["isometric_cutaway"])
+    hidden_prefixes = tuple(cam.get("hide_cutaway_classes") or ())
+    kept = [
+        (mesh, rgba)
+        for ifc_cls, mesh, rgba in labeled_meshes
+        if not (hidden_prefixes and any(ifc_cls.startswith(p) for p in hidden_prefixes))
+    ]
+    if not kept:
+        kept = [(mesh, rgba) for _, mesh, rgba in labeled_meshes]
+    return kept
+
+
+def ifc_to_glb_and_control(
+    ifc_path: str | Path,
+    out_dir: str | Path,
+    *,
+    camera_preset: str = "isometric_cutaway",
+    width: int = 1024,
+    height: int = 768,
+) -> dict[str, str | None]:
+    """Convert an IFC 4.3 file into an interactive ``model.glb`` + headless ``depth.png`` and ``clay.png``."""
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    scene, labeled_meshes, storey_elevations_m = _load_ifc_scene_and_meshes(ifc_path)
     glb_path = out_path / "model.glb"
     glb_path.write_bytes(scene.export(file_type="glb"))
 
-    if not control_meshes:
-        # Fallback if model only had roof/coverings.
-        control_meshes = [(geom, (215, 215, 215, 255)) for geom in scene.geometry.values()]
-
+    control_meshes = _filter_meshes_for_camera(labeled_meshes, camera_preset)
     depth_pil, clay_pil = _rasterize_camera_views(
         control_meshes,
         camera_preset=camera_preset,
         width=width,
         height=height,
+        storey_elevations_m=storey_elevations_m,
     )
     depth_path = out_path / "depth.png"
     clay_path = out_path / "clay.png"
@@ -375,6 +628,158 @@ def ifc_to_glb_and_control(
         "glb_path": str(glb_path),
         "depth_path": str(depth_path),
         "clay_path": str(clay_path),
+    }
+
+
+def compose_grid(
+    image_paths: list[str | Path],
+    captions: list[str],
+    out_path: str | Path,
+    *,
+    cols: int = 2,
+    pad: int = 16,
+) -> str:
+    """Stitch multiple PNGs into a clean white presentation board with captions."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    if not image_paths:
+        raise ValueError("image_paths must be non-empty")
+
+    imgs = [Image.open(p).convert("RGB") for p in image_paths]
+    cell_w = max(im.width for im in imgs)
+    cell_h = max(im.height for im in imgs)
+    caption_h = 44
+    rows = math.ceil(len(imgs) / max(1, cols))
+
+    try:
+        font = ImageFont.load_default(size=22)
+    except TypeError:
+        font = ImageFont.load_default()
+
+    board_w = pad + cols * (cell_w + pad)
+    board_h = pad + rows * (cell_h + caption_h + pad)
+    board = Image.new("RGB", (board_w, board_h), (255, 255, 255))
+    draw = ImageDraw.Draw(board)
+
+    for idx, im in enumerate(imgs):
+        r = idx // cols
+        c = idx % cols
+        x = pad + c * (cell_w + pad)
+        y = pad + r * (cell_h + caption_h + pad)
+        resized = im.resize((cell_w, cell_h), Image.Resampling.LANCZOS)
+        board.paste(resized, (x, y))
+        draw.rectangle([x, y, x + cell_w - 1, y + cell_h - 1], outline=(220, 222, 226), width=2)
+        cap = captions[idx] if idx < len(captions) else f"View {idx + 1}"
+        draw.text((x + 10, y + cell_h + 10), cap, fill=(32, 34, 38), font=font)
+
+    out_file = Path(out_path)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    board.save(out_file)
+    return str(out_file)
+
+
+def render_ifc_turntable_gif(
+    ifc_path: str | Path,
+    out_gif_path: str | Path,
+    *,
+    num_frames: int = 18,
+    width: int = 512,
+    height: int = 384,
+    elevation_deg: float = 34.0,
+    duration_ms: int = 110,
+) -> str:
+    """Render a smooth 360-degree isometric cutaway turntable GIF directly from IFC geometry."""
+    _, labeled_meshes, storey_elevations_m = _load_ifc_scene_and_meshes(ifc_path)
+    meshes = _filter_meshes_for_camera(labeled_meshes, "isometric_cutaway")
+
+    frames = []
+    for frame_idx in range(max(4, num_frames)):
+        az = (360.0 * frame_idx) / max(4, num_frames)
+        _, clay_pil = _rasterize_camera_views(
+            meshes,
+            camera_preset="isometric_cutaway",
+            width=width,
+            height=height,
+            azimuth_override=az,
+            elevation_override=elevation_deg,
+            storey_elevations_m=storey_elevations_m,
+        )
+        frames.append(clay_pil)
+
+    out_file = Path(out_gif_path)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    frames[0].save(
+        out_file,
+        save_all=True,
+        append_images=frames[1:],
+        duration=duration_ms,
+        loop=0,
+    )
+    return str(out_file)
+
+
+def render_storyboard_4up(
+    ifc_path: str | Path,
+    out_dir: str | Path,
+    user_vibe: str,
+    style_key: str,
+    *,
+    render_photoreal_shots: bool = True,
+    backend: str = "sdxl_depth",
+    steps: int = 18,
+    seed: int = 42,
+    width: int = 768,
+    height: int = 576,
+) -> dict[str, Any]:
+    """Render a 4-angle presentation board (2x2) locked to a single IFC model."""
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    _, labeled_meshes, storey_elevations_m = _load_ifc_scene_and_meshes(ifc_path)
+
+    cam_keys = ["isometric_cutaway", "eye_level_interior", "opposite_interior", "corner_axonometric"]
+    clay_paths: list[str] = []
+    depth_paths: list[str] = []
+    shots: list[str] = []
+    captions: list[str] = []
+
+    for cam_key in cam_keys:
+        meshes = _filter_meshes_for_camera(labeled_meshes, cam_key)
+        depth_pil, clay_pil = _rasterize_camera_views(
+            meshes,
+            camera_preset=cam_key,
+            width=width,
+            height=height,
+            storey_elevations_m=storey_elevations_m,
+        )
+        d_path = out_path / f"depth_{cam_key}.png"
+        c_path = out_path / f"clay_{cam_key}.png"
+        depth_pil.save(d_path)
+        clay_pil.save(c_path)
+        depth_paths.append(str(d_path))
+        clay_paths.append(str(c_path))
+        captions.append(CAMERA_PRESETS[cam_key]["label"])
+
+        if render_photoreal_shots:
+            r_path = render_photoreal(
+                d_path,
+                user_vibe,
+                style_key,
+                cam_key,
+                out_path / f"render_{cam_key}.png",
+                backend=backend,
+                steps=steps,
+                seed=seed,
+            )
+            shots.append(r_path)
+        else:
+            shots.append(str(c_path))
+
+    board_path = compose_grid(shots, captions, out_path / "storyboard_2x2.png", cols=2)
+    return {
+        "board_path": board_path,
+        "shots": shots,
+        "clay_paths": clay_paths,
+        "depth_paths": depth_paths,
     }
 
 
