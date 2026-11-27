@@ -242,6 +242,24 @@ def _vec_norm(a: tuple[float, float, float]) -> tuple[float, float, float]:
     return (a[0] / mag, a[1] / mag, a[2] / mag)
 
 
+_SKIP_IFC_CLASSES: tuple[str, ...] = (
+    "IfcOpeningElement",
+    "IfcOpeningStandardCase",
+    "IfcSpace",
+    "IfcVirtualElement",
+    "IfcAnnotation",
+    "IfcGrid",
+)
+
+
+def _should_skip_ifc_class(ifc_cls: str) -> bool:
+    """Skip void/opening solids, space volumes, grids, and 2D annotations in 3D render/raycast meshes.
+
+    Exact class names only: a prefix match on "IfcSpace" would also hide IfcSpaceHeater.
+    """
+    return ifc_cls in _SKIP_IFC_CLASSES
+
+
 def compute_camera_pose(
     vmin: tuple[float, float, float] | list[float],
     vmax: tuple[float, float, float] | list[float],
@@ -249,6 +267,7 @@ def compute_camera_pose(
     *,
     storey_elevations_m: list[float] | None = None,
     storey_index: int = 0,
+    space_boxes: list[dict[str, float]] | None = None,
     width: int = 1024,
     height: int = 768,
     azimuth_override: float | None = None,
@@ -269,8 +288,10 @@ def compute_camera_pose(
     extent = max(math.sqrt(dx * dx + dy * dy + dz * dz), 1.0)
     radius = 0.5 * extent
 
-    az = math.radians(cam["azimuth_deg"] if azimuth_override is None else azimuth_override)
-    el = math.radians(cam["elevation_deg"] if elevation_override is None else elevation_override)
+    az_deg = cam["azimuth_deg"] if azimuth_override is None else azimuth_override
+    el_deg = cam["elevation_deg"] if elevation_override is None else elevation_override
+    az = math.radians(az_deg)
+    el = math.radians(el_deg)
     cam_dir = (
         math.cos(el) * math.cos(az),
         math.cos(el) * math.sin(az),
@@ -280,19 +301,50 @@ def compute_camera_pose(
     if cam["projection"] == "perspective":
         if storey_elevations_m:
             s_idx = min(max(0, storey_index), len(storey_elevations_m) - 1)
-            eye_z = float(storey_elevations_m[s_idx]) + 1.6
+            storey_z = float(storey_elevations_m[s_idx])
         else:
-            eye_z = vmin_t[2] + 1.6
-        eye = (
-            center[0] - 0.18 * extent * math.cos(az),
-            center[1] - 0.18 * extent * math.sin(az),
-            eye_z,
-        )
-        target = (
-            center[0] + 0.25 * extent * math.cos(az),
-            center[1] + 0.25 * extent * math.sin(az),
-            eye_z,
-        )
+            storey_z = vmin_t[2]
+        eye_z = storey_z + 1.6
+
+        chosen_space: dict[str, float] | None = None
+        if space_boxes:
+            on_storey = [sb for sb in space_boxes if abs(float(sb["zmin"]) - storey_z) < 0.6]
+            candidates = on_storey or list(space_boxes)
+            best_sb = max(
+                candidates,
+                key=lambda sb: max(0.0, float(sb["xmax"]) - float(sb["xmin"]))
+                * max(0.0, float(sb["ymax"]) - float(sb["ymin"])),
+            )
+            if (float(best_sb["xmax"]) - float(best_sb["xmin"])) > 1.2 and (
+                float(best_sb["ymax"]) - float(best_sb["ymin"])
+            ) > 1.2:
+                chosen_space = best_sb
+
+        if chosen_space is not None:
+            sx_min = float(chosen_space["xmin"])
+            sy_min = float(chosen_space["ymin"])
+            sx_max = float(chosen_space["xmax"])
+            sy_max = float(chosen_space["ymax"])
+            eye_z = float(chosen_space["zmin"]) + 1.6
+            mx = min(0.8, 0.16 * (sx_max - sx_min))
+            my = min(0.8, 0.16 * (sy_max - sy_min))
+            corner_a = (sx_min + mx, sy_min + my, eye_z)
+            corner_b = (sx_max - mx, sy_max - my, eye_z)
+            is_opp = camera_preset == "opposite_interior" or (
+                camera_preset != "eye_level_interior" and (az_deg % 360.0) >= 180.0
+            )
+            eye, target = (corner_b, corner_a) if is_opp else (corner_a, corner_b)
+        else:
+            eye = (
+                center[0] - 0.18 * extent * math.cos(az),
+                center[1] - 0.18 * extent * math.sin(az),
+                eye_z,
+            )
+            target = (
+                center[0] + 0.25 * extent * math.cos(az),
+                center[1] + 0.25 * extent * math.sin(az),
+                eye_z,
+            )
     else:
         eye = (
             center[0] + cam_dir[0] * (1.8 * extent),
@@ -345,6 +397,7 @@ def _rasterize_camera_views(
     elevation_override: float | None = None,
     storey_elevations_m: list[float] | None = None,
     storey_index: int = 0,
+    space_boxes: list[dict[str, float]] | None = None,
     light_dir_override: tuple[float, float, float] | list[float] | None = None,
 ) -> tuple[Any, Any]:
     """Pure-NumPy headless software z-buffer rasterizer producing `(depth_pil, clay_pil)`."""
@@ -365,6 +418,7 @@ def _rasterize_camera_views(
         camera_preset,
         storey_elevations_m=storey_elevations_m,
         storey_index=storey_index,
+        space_boxes=space_boxes,
         width=width,
         height=height,
         azimuth_override=azimuth_override,
@@ -526,10 +580,14 @@ def _rasterize_camera_views(
     return Image.fromarray(depth_img, mode="L"), Image.fromarray(cbuf, mode="RGB")
 
 
-def _load_ifc_scene_and_meshes(
+def _load_ifc_scene_and_metadata(
     ifc_path: str | Path,
-) -> tuple[Any, list[tuple[str, Any, tuple[int, int, int, int]]], list[float]]:
-    """Parse an IFC 4.3 file once into `(trimesh.Scene, labeled_meshes, storey_elevations_m)`."""
+) -> tuple[Any, list[tuple[str, Any, tuple[int, int, int, int]]], list[float], list[dict[str, float]]]:
+    """Parse an IFC 4.3 file once into `(scene, labeled_meshes, storey_elevations_m, space_boxes)`.
+
+    Skips opening voids, space volumes, virtual boundaries, grids, and 2D annotations so
+    boolean opening cuts on walls stay open in both renders and solar raycasts.
+    """
     import ifcopenshell  # type: ignore
     import ifcopenshell.geom  # type: ignore
     import ifcopenshell.util.unit  # type: ignore
@@ -550,10 +608,16 @@ def _load_ifc_scene_and_meshes(
     scene = trimesh.Scene()
     labeled_meshes: list[tuple[str, Any, tuple[int, int, int, int]]] = []
     slab_top_zs: list[float] = []
+    space_boxes: list[dict[str, float]] = []
 
     for product in ifc_file.by_type("IfcProduct"):
         if product.Representation is None:
             continue
+        ifc_cls = product.is_a()
+        is_space = ifc_cls == "IfcSpace"  # exact: IfcSpaceHeater is equipment, not a room
+        if not is_space and _should_skip_ifc_class(ifc_cls):
+            continue
+
         try:
             shape = ifcopenshell.geom.create_shape(settings, product)
         except Exception:
@@ -564,7 +628,18 @@ def _load_ifc_scene_and_meshes(
         if len(verts) == 0 or len(faces) == 0:
             continue
 
-        ifc_cls = product.is_a()
+        if is_space:
+            space_boxes.append(
+                {
+                    "xmin": float(verts[:, 0].min()),
+                    "ymin": float(verts[:, 1].min()),
+                    "xmax": float(verts[:, 0].max()),
+                    "ymax": float(verts[:, 1].max()),
+                    "zmin": float(verts[:, 2].min()),
+                }
+            )
+            continue
+
         if ifc_cls.startswith("IfcSlab"):
             slab_top_zs.append(float(verts[:, 2].max()))
         rgba = _color_for_ifc_class(ifc_cls)
@@ -576,7 +651,90 @@ def _load_ifc_scene_and_meshes(
     if not storey_elevations_m and slab_top_zs:
         storey_elevations_m = [min(slab_top_zs)]
 
+    return scene, labeled_meshes, storey_elevations_m, space_boxes
+
+
+def _load_ifc_scene_and_meshes(
+    ifc_path: str | Path,
+) -> tuple[Any, list[tuple[str, Any, tuple[int, int, int, int]]], list[float]]:
+    """Backward-compatible loader returning `(trimesh.Scene, labeled_meshes, storey_elevations_m)`."""
+    scene, labeled_meshes, storey_elevations_m, _ = _load_ifc_scene_and_metadata(ifc_path)
     return scene, labeled_meshes, storey_elevations_m
+
+
+def _build_synthetic_floor_meshes(
+    labeled_meshes: list[tuple[str, Any, tuple[int, int, int, int]]],
+    storey_elevations_m: list[float],
+    space_boxes: list[dict[str, float]] | None = None,
+) -> list[tuple[Any, tuple[int, int, int, int]]]:
+    """Synthesize flat render/depth-only floor quads per storey lacking an ``IfcSlab``."""
+    import numpy as np
+    import trimesh  # type: ignore
+
+    if not labeled_meshes:
+        return []
+
+    slab_zs = [
+        float(m.vertices[:, 2].max())
+        for ifc_cls, m, _ in labeled_meshes
+        if ifc_cls.startswith("IfcSlab") and len(m.vertices) > 0
+    ]
+    all_verts = np.vstack([m.vertices for _, m, _ in labeled_meshes])
+    all_xmin, all_ymin = float(all_verts[:, 0].min()), float(all_verts[:, 1].min())
+    all_xmax, all_ymax = float(all_verts[:, 0].max()), float(all_verts[:, 1].max())
+    target_elevs = storey_elevations_m or [float(all_verts[:, 2].min())]
+
+    floor_rgba = (205, 202, 196, 255)
+    floors: list[tuple[Any, tuple[int, int, int, int]]] = []
+
+    def _quad_mesh(xmin: float, ymin: float, xmax: float, ymax: float, z: float) -> Any:
+        verts = np.array(
+            [
+                [xmin, ymin, z],
+                [xmax, ymin, z],
+                [xmax, ymax, z],
+                [xmin, ymax, z],
+            ],
+            dtype=np.float64,
+        )
+        faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
+        mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+        mesh.visual.face_colors = np.tile(np.array(floor_rgba, dtype=np.uint8), (2, 1))
+        return mesh
+
+    for elev in target_elevs:
+        if any(abs(sz - elev) <= 0.35 for sz in slab_zs):
+            continue
+        storey_spaces = [sb for sb in (space_boxes or []) if abs(float(sb["zmin"]) - elev) < 0.6]
+        if storey_spaces:
+            for sb in storey_spaces:
+                floors.append(
+                    (
+                        _quad_mesh(
+                            float(sb["xmin"]),
+                            float(sb["ymin"]),
+                            float(sb["xmax"]),
+                            float(sb["ymax"]),
+                            elev,
+                        ),
+                        floor_rgba,
+                    )
+                )
+        else:
+            st_verts = [
+                m.vertices
+                for _, m, _ in labeled_meshes
+                if len(m.vertices) > 0 and elev - 0.6 <= float(m.vertices[:, 2].min()) <= elev + 1.0
+            ]
+            if st_verts:
+                sv = np.vstack(st_verts)
+                xmin, ymin = float(sv[:, 0].min()), float(sv[:, 1].min())
+                xmax, ymax = float(sv[:, 0].max()), float(sv[:, 1].max())
+            else:
+                xmin, ymin, xmax, ymax = all_xmin, all_ymin, all_xmax, all_ymax
+            floors.append((_quad_mesh(xmin, ymin, xmax, ymax, elev), floor_rgba))
+
+    return floors
 
 
 def _filter_meshes_for_camera(
@@ -607,17 +765,19 @@ def ifc_to_glb_and_control(
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    scene, labeled_meshes, storey_elevations_m = _load_ifc_scene_and_meshes(ifc_path)
+    scene, labeled_meshes, storey_elevations_m, space_boxes = _load_ifc_scene_and_metadata(ifc_path)
     glb_path = out_path / "model.glb"
     glb_path.write_bytes(scene.export(file_type="glb"))
 
     control_meshes = _filter_meshes_for_camera(labeled_meshes, camera_preset)
+    control_meshes = [*control_meshes, *_build_synthetic_floor_meshes(labeled_meshes, storey_elevations_m, space_boxes)]
     depth_pil, clay_pil = _rasterize_camera_views(
         control_meshes,
         camera_preset=camera_preset,
         width=width,
         height=height,
         storey_elevations_m=storey_elevations_m,
+        space_boxes=space_boxes,
     )
     depth_path = out_path / "depth.png"
     clay_path = out_path / "clay.png"
@@ -689,8 +849,11 @@ def render_ifc_turntable_gif(
     duration_ms: int = 110,
 ) -> str:
     """Render a smooth 360-degree isometric cutaway turntable GIF directly from IFC geometry."""
-    _, labeled_meshes, storey_elevations_m = _load_ifc_scene_and_meshes(ifc_path)
-    meshes = _filter_meshes_for_camera(labeled_meshes, "isometric_cutaway")
+    _, labeled_meshes, storey_elevations_m, space_boxes = _load_ifc_scene_and_metadata(ifc_path)
+    meshes = [
+        *_filter_meshes_for_camera(labeled_meshes, "isometric_cutaway"),
+        *_build_synthetic_floor_meshes(labeled_meshes, storey_elevations_m, space_boxes),
+    ]
 
     frames = []
     for frame_idx in range(max(4, num_frames)):
@@ -734,7 +897,8 @@ def render_storyboard_4up(
     """Render a 4-angle presentation board (2x2) locked to a single IFC model."""
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
-    _, labeled_meshes, storey_elevations_m = _load_ifc_scene_and_meshes(ifc_path)
+    _, labeled_meshes, storey_elevations_m, space_boxes = _load_ifc_scene_and_metadata(ifc_path)
+    synth_floors = _build_synthetic_floor_meshes(labeled_meshes, storey_elevations_m, space_boxes)
 
     cam_keys = ["isometric_cutaway", "eye_level_interior", "opposite_interior", "corner_axonometric"]
     clay_paths: list[str] = []
@@ -743,13 +907,14 @@ def render_storyboard_4up(
     captions: list[str] = []
 
     for cam_key in cam_keys:
-        meshes = _filter_meshes_for_camera(labeled_meshes, cam_key)
+        meshes = [*_filter_meshes_for_camera(labeled_meshes, cam_key), *synth_floors]
         depth_pil, clay_pil = _rasterize_camera_views(
             meshes,
             camera_preset=cam_key,
             width=width,
             height=height,
             storey_elevations_m=storey_elevations_m,
+            space_boxes=space_boxes,
         )
         d_path = out_path / f"depth_{cam_key}.png"
         c_path = out_path / f"clay_{cam_key}.png"

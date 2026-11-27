@@ -42,7 +42,7 @@ Every contributor's LoRA must live in the exact same linear subspace so adapters
 
 * **Base Model:** `google/gemma-4-31B-it` (`unsloth/gemma-4-31B-it`, 60 dense Transformer layers, Apache-2.0, native thinking + native vision upside)
 * **LoRA Spec:** `r = 16`, `lora_alpha = 16`, `lora_dropout = 0.0`, `bias = "none"`, `target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]`
-* **MutinyBIM Verifier Target:** [`permitzip/mutinybim`](https://github.com/permitzip/mutinybim) @ commit `efe343144c61cd8e08890b75f5f45c3541fe4abb` (Node `>=22.13`)
+* **MutinyBIM Verifier Target:** [`permitzip/mutinybim`](https://github.com/permitzip/mutinybim) @ commit `fbf5f61424b64d9f99b1c896ca02328c88d9813c` (Node `>=22.13`)
 
 ### Reward Ladder (`verifier/server.mjs`)
 Every generated `defineScript(...)` is evaluated in-memory against warm `@permitzip/bim-script`, `@permitzip/bim-kernel`, and `@permitzip/bim-lint`:

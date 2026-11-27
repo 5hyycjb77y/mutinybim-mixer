@@ -37,7 +37,7 @@
   },
   "mutinybim": {
     "repo": "https://github.com/permitzip/mutinybim.git",
-    "commit": "efe343144c61cd8e08890b75f5f45c3541fe4abb",
+    "commit": "fbf5f61424b64d9f99b1c896ca02328c88d9813c",
     "node_min": "22.13"
   },
   "trades": {

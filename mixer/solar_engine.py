@@ -925,7 +925,6 @@ def envelope_gates(
         else:
             outer_poly_by_storey[s_key] = poly
             exterior_wall_idxs.update(b_idxs)
-            exterior_wall_idxs.update(w["idx"] for w in hinted)
 
     max_wall_top_z = max(w["top_z_m"] for w in walls)
     top_storey_base_z = max(storeys.keys())

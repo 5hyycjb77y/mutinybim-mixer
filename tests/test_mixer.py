@@ -44,6 +44,7 @@ from mixer.studio_render import (
     VIBE_INSPIRATION_CHIPS,
     _clip_near,
     _rasterize_camera_views,
+    _should_skip_ifc_class,
     build_render_prompt,
     compute_camera_pose,
 )
@@ -64,7 +65,7 @@ class TestConfigs(unittest.TestCase):
         self.assertEqual(spec["base_model"]["hf_id"], "google/gemma-4-31B-it")
         self.assertEqual(spec["base_model"]["num_hidden_layers"], 60)
         self.assertEqual(spec["lora"]["r"], 16)
-        self.assertEqual(spec["mutinybim"]["commit"], "efe343144c61cd8e08890b75f5f45c3541fe4abb")
+        self.assertEqual(spec["mutinybim"]["commit"], "fbf5f61424b64d9f99b1c896ca02328c88d9813c")
         self.assertAlmostEqual(sum(spec["reward_weights"].values()), 1.0, places=6)
         for trade in (
             "architecture",
@@ -135,7 +136,7 @@ class TestMockVerifierClient(unittest.TestCase):
 
             def do_GET(self) -> None:  # noqa: N802
                 if self.path == "/health":
-                    self._send(200, {"status": "ok", "mutinybim_commit": "efe343144c61"})
+                    self._send(200, {"status": "ok", "mutinybim_commit": "fbf5f61424b6"})
                 elif self.path.startswith("/reference"):
                     self._send(200, {"markdown": "# Ref", "declarations": "", "examples": []})
                 else:
@@ -477,6 +478,49 @@ class TestStudioRender(unittest.TestCase):
             arr = np.asarray(depth_pil)
             self.assertEqual(int(np.sum(arr == 0)), 0, f"Background hole found in {cam_key}")
 
+    def test_skip_ifc_classes_and_room_diagonal_interior_cameras(self) -> None:
+        for cls_name in (
+            "IfcOpeningElement",
+            "IfcOpeningStandardCase",
+            "IfcSpace",
+            "IfcVirtualElement",
+            "IfcAnnotation",
+            "IfcGrid",
+        ):
+            self.assertTrue(_should_skip_ifc_class(cls_name), cls_name)
+        for cls_name in ("IfcWall", "IfcWallStandardCase", "IfcDoor", "IfcWindow", "IfcSlab", "IfcRoof", "IfcSpaceHeater"):
+            self.assertFalse(_should_skip_ifc_class(cls_name), cls_name)
+
+        spaces = [
+            {"xmin": 0.0, "ymin": 0.0, "xmax": 7.0, "ymax": 9.0, "zmin": 0.0},
+            {"xmin": 7.0, "ymin": 0.0, "xmax": 12.0, "ymax": 4.5, "zmin": 0.0},
+        ]
+        p_eye = compute_camera_pose(
+            (0.0, 0.0, 0.0),
+            (12.0, 9.0, 7.0),
+            "eye_level_interior",
+            storey_elevations_m=[0.0, 3.6],
+            storey_index=0,
+            space_boxes=spaces,
+        )
+        p_opp = compute_camera_pose(
+            (0.0, 0.0, 0.0),
+            (12.0, 9.0, 7.0),
+            "opposite_interior",
+            storey_elevations_m=[0.0, 3.6],
+            storey_index=0,
+            space_boxes=spaces,
+        )
+        # Both cameras sit strictly inside the largest room (0..7 x 0..9) at 1.6 m eye height, looking diagonally across it.
+        self.assertGreater(p_eye["eye"][0], 0.0)
+        self.assertLess(p_eye["eye"][0], 3.5)
+        self.assertAlmostEqual(p_eye["eye"][2], 1.6, places=4)
+        self.assertGreater(p_opp["eye"][0], 3.5)
+        self.assertLess(p_opp["eye"][0], 7.0)
+        self.assertAlmostEqual(p_opp["eye"][2], 1.6, places=4)
+        self.assertAlmostEqual(p_eye["eye"][0], p_opp["target"][0], places=4)
+        self.assertAlmostEqual(p_opp["eye"][0], p_eye["target"][0], places=4)
+
 
 class TestSolarEngine(unittest.TestCase):
     def test_solar_position_hemispheres_and_equinox(self) -> None:
@@ -780,6 +824,17 @@ ENDSEC;
         self.assertTrue(ifc_gates["has_closed_envelope"])
         self.assertEqual(ifc_gates["exterior_wall_count"], 4)
         self.assertAlmostEqual(ifc_gates["facade_wwr"]["S"], 0.2, places=3)  # 6 m² / 30 m² = 0.20
+
+        # 7. Interior partitions inside a closed perimeter — even tagged is_external=True — do NOT count in exterior_wall_count.
+        with_partitions = [
+            *base_walls,
+            {"id": "p1", "start": (5.0, 0.0), "end": (5.0, 8.0), "height_m": 3.0, "is_external": True},
+            {"id": "p2", "start": (5.0, 4.0), "end": (10.0, 4.0), "height_m": 3.0, "is_external": True},
+        ]
+        part_gates = envelope_gates({"walls": with_partitions, "windows": win_25, "roofs": [{"id": "r1"}], "slabs": floor_only})
+        self.assertTrue(part_gates["has_closed_envelope"])
+        self.assertEqual(part_gates["exterior_wall_count"], 4)
+        self.assertAlmostEqual(part_gates["facade_wwr"]["S"], 0.25, places=3)
 
 
 class TestSketchEngine(unittest.TestCase):

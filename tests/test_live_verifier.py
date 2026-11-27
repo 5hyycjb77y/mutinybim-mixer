@@ -11,7 +11,7 @@ from urllib.error import URLError
 
 from verifier.verify_client import MutinyVerifierClient
 from mixer.lora_ops import load_spec
-from mixer.solar_engine import envelope_gates, read_ifc_true_north_deg
+from mixer.solar_engine import _split_step_args, envelope_gates, read_ifc_true_north_deg
 
 ROOT = Path(__file__).resolve().parent.parent
 CHECKOUT = os.environ.get("MIXER_TEST_MUTINYBIM")
@@ -50,10 +50,17 @@ class TestLiveVerifier(unittest.TestCase):
                 self.assertTrue(bundle.verify.ok, bundle.verify.error)
                 self.assertIn("IFC4X3", bundle.ifc_text or "")
                 self.assertIn("IFCGEOMETRICREPRESENTATIONCONTEXT", bundle.ifc_text or "")
+                self.assertIn("IFCOPENINGELEMENT", bundle.ifc_text or "")
+                # Every IfcOpeningElement at fbf5f61 has a body (non-$ Representation attribute at index 6).
+                opening_lines = [ln for ln in (bundle.ifc_text or "").splitlines() if "=IFCOPENINGELEMENT(" in ln]
+                self.assertGreaterEqual(len(opening_lines), 10)
+                for ln in opening_lines:
+                    args = _split_step_args(ln.split("(", 1)[1].rsplit(")", 1)[0])
+                    self.assertTrue(len(args) >= 7 and args[6].startswith("#"), f"Opening missing body: {ln}")
                 self.assertEqual(read_ifc_true_north_deg(bundle.ifc_text or ""), 0.0)
                 gates = envelope_gates(bundle.ifc_text or "")
                 self.assertTrue(gates["storeys_closed"], gates)
-                self.assertGreaterEqual(gates["exterior_wall_count"], 4)
+                self.assertEqual(gates["exterior_wall_count"], 8, gates)
                 self.assertGreaterEqual(gates["max_facade_wwr"], 0.0)
                 self.assertLessEqual(gates["max_facade_wwr"], 1.0)
                 self.assertEqual(gates["true_north_deg"], 0.0)
